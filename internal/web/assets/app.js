@@ -857,11 +857,23 @@
   }
   // OAuth authorizations
   function renderAuthorizationRow(authorization) {
+    const isCIMD = authorization.registration === 'cimd';
+    const source = isCIMD
+      ? /* HTML */ `
+          <p class="authorization-source">
+            来源 <strong class="mono break">${esc(authorization.metadata_host)}</strong>
+          </p>
+        `
+      : '';
     return /* HTML */ `
       <article class="resource">
         <div class="resource-head">
           <div>
-            <h3>${esc(authorization.client_name || '未命名客户端')}</h3>
+            <div class="resource-heading">
+              <h3>${esc(authorization.client_name || '未命名客户端')}</h3>
+              <span class="badge">${isCIMD ? 'CIMD' : '动态注册'}</span>
+            </div>
+            ${source}
             <p class="mono">${esc(authorization.redirect_host)}</p>
           </div>
           <button

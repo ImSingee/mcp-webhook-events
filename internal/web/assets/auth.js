@@ -94,6 +94,40 @@
     `;
   }
 
+  function renderConsentClient(client) {
+    const clientName = esc(client.name || '未命名客户端');
+    if (client.registration !== 'cimd') {
+      return `<div class="consent-client">${clientName}</div>`;
+    }
+    return /* HTML */ `
+      <div class="consent-source">
+        <strong class="consent-domain mono">${esc(client.metadata_host)}</strong>
+        <span class="badge">CIMD</span>
+        <span class="consent-client-name">${clientName}</span>
+      </div>
+      <p class="hint consent-disclaimer">
+        名称由该网站上的文档自称，未经平台审核。请核对来源域名。
+      </p>
+      <details>
+        <summary>查看客户端 ID</summary>
+        <code class="break">${esc(client.id)}</code>
+      </details>
+    `;
+  }
+
+  function renderConsentWarning(warning) {
+    const message = warning.code === 'localhost_redirect'
+      ? '该应用用网址标识自己，却要将你重定向回本机地址。' +
+        '本机上的其他程序可能冒充它，请确认这是你发起接入的程序。'
+      : warning.message;
+    return /* HTML */ `
+      <div class="notice warning consent-warning" role="note">
+        <strong>接入风险提示</strong>
+        <p>${esc(message)}</p>
+      </div>
+    `;
+  }
+
   async function start() {
     if (!request) {
       expired();
@@ -118,9 +152,7 @@
         </p>
         <div class="consent-flow">
           <div class="hint">发起接入的程序</div>
-          <div class="consent-client">
-            ${esc(client.name || '未命名客户端')}
-          </div>
+          ${renderConsentClient(client)}
           <div class="consent-host">
             回调至
             <strong class="mono">${esc(client.redirect_host)}</strong>
@@ -130,6 +162,7 @@
             <summary>查看完整回调地址</summary>
             <code class="break">${esc(client.redirect_uri)}</code>
           </details>
+          ${(client.warnings || []).map(renderConsentWarning).join('')}
           <div class="flow-arrow" aria-hidden="true">↓</div>
           <div class="hint">将以此 Agent Identity 的身份接入</div>
           <div class="target" id="identity-target"></div>

@@ -1094,6 +1094,39 @@ summary {
   font-weight: 650;
   overflow-wrap: anywhere;
 }
+/* CIMD source identity and consent warnings */
+.consent-source {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px 12px;
+  margin-top: 4px;
+  min-width: 0;
+}
+.consent-domain {
+  font-size: 23px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+.consent-client-name {
+  flex-basis: 100%;
+  font-size: 16px;
+  overflow-wrap: anywhere;
+}
+.consent-disclaimer {
+  margin: 8px 0;
+}
+.consent-warning {
+  margin-top: 16px;
+  overflow-wrap: anywhere;
+}
+.consent-warning p {
+  margin: 4px 0 0;
+}
+.authorization-source {
+  margin-top: 6px;
+  overflow-wrap: anywhere;
+}
 .consent-flow .flow-arrow {
   margin: 16px 0;
   color: var(--primary);
