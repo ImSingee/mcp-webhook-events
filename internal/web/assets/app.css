@@ -590,6 +590,35 @@ pre {
     opacity: 0.3;
   }
 }
+/* Feedback belongs to the data region; its surrounding navigation stays stable. */
+.data-region {
+  min-height: 100px;
+}
+[aria-busy='true'] {
+  position: relative;
+}
+.refreshing::after {
+  content: '';
+  position: absolute;
+  inset: 0 0 auto;
+  height: 2px;
+  background: var(--primary);
+  pointer-events: none;
+}
+.region-status:not(.loading) {
+  color: var(--muted);
+  font-size: 12px;
+  padding: 8px 12px;
+}
+.region-error {
+  margin-top: 12px;
+}
+.region-error .error {
+  margin: 0 0 10px;
+}
+#identity-summary:empty {
+  display: none;
+}
 .error {
   color: var(--danger);
   font-size: 13px;
@@ -943,7 +972,10 @@ pre {
 }
 .load-more {
   display: flex;
+  align-items: center;
   justify-content: center;
+  flex-wrap: wrap;
+  gap: 8px;
   padding: 22px;
 }
 .event-details {

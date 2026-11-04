@@ -17,7 +17,13 @@
   // Workspace state and shared form markup
   const main = $('#main');
   let identities = [];
-  let generation = 0;
+  let identitiesLoaded = false;
+  let identitiesRevision = 0;
+  let identitiesRequest;
+  let currentView;
+  const tabCache = new Map();
+  const regions = new Map();
+  const loadingDelay = 180;
   let eventSource;
   let eventsState;
   const normalPattern = '[a-z0-9]+(-[a-z0-9]+)*';
@@ -117,6 +123,154 @@
     `;
   }
 
+  // Each region owns its request, delayed feedback, and retry. Old content stays interactive.
+  function cancelRegion(host) {
+    const request = regions.get(host);
+    if (!request) {
+      return;
+    }
+    request.controller.abort();
+    clearTimeout(request.timer);
+    request.status.remove();
+    host.removeAttribute('aria-busy');
+    host.classList.remove('refreshing');
+    regions.delete(host);
+  }
+
+  async function loadRegion(
+    host,
+    label,
+    load,
+    apply,
+    populated = false,
+    options = {}
+  ) {
+    const { background = false, retry } = options;
+    cancelRegion(host);
+    const previousError = host.querySelector(':scope > .region-error');
+    if (previousError?.contains(document.activeElement)) {
+      host.setAttribute('tabindex', '-1');
+      host.focus({ preventScroll: true });
+    }
+    previousError?.remove();
+    const controller = new AbortController();
+    const status = document.createElement('div');
+    status.className = populated ? 'region-status' : 'loading region-status';
+    status.setAttribute('role', 'status');
+    const request = { controller, status };
+    regions.set(host, request);
+    if (!background) {
+      host.setAttribute('aria-busy', 'true');
+    }
+    request.timer = setTimeout(() => {
+      if (background || regions.get(host) !== request || !host.isConnected) {
+        return;
+      }
+      status.textContent = populated ? '正在刷新…' : `正在加载${label}…`;
+      host.classList.toggle('refreshing', populated);
+      host.append(status);
+    }, loadingDelay);
+    try {
+      const data = await load(controller.signal);
+      if (regions.get(host) === request && host.isConnected) {
+        apply(data);
+      }
+    } catch (requestError) {
+      if (
+        regions.get(host) === request &&
+        host.isConnected &&
+        requestError.name !== 'AbortError' &&
+        requestError.status !== 401
+      ) {
+        const error = document.createElement('div');
+        error.className = 'notice warning region-error';
+        error.innerHTML = /* HTML */ `
+          <p class="error" role="alert">
+            ${esc(label)}加载失败：${esc(requestError.message)}
+          </p>
+          <button class="button" type="button">重试</button>
+        `;
+        $('button', error).onclick =
+          retry ||
+          (() => loadRegion(host, label, load, apply, populated, options));
+        host.append(error);
+      }
+    } finally {
+      if (regions.get(host) === request) {
+        cancelRegion(host);
+      }
+    }
+  }
+
+  // Reconcile keyed rows so unchanged rows, focused controls and open details survive refreshes.
+  function patchRows(host, markup) {
+    const template = document.createElement('template');
+    template.innerHTML = markup;
+    const previous = new Map(
+      [...host.children]
+        .filter((node) => node.dataset.rowKey)
+        .map((node) => [node.dataset.rowKey, node])
+    );
+    const focused = host.contains(document.activeElement)
+      ? document.activeElement
+      : null;
+    const focusAttributes = focused
+      ? [...focused.attributes].filter(
+          (attribute) =>
+            attribute.name === 'id' || attribute.name === 'href' || attribute.name.startsWith('data-')
+        )
+      : [];
+    let cursor = host.firstElementChild;
+    for (const next of [...template.content.children]) {
+      const existing = previous.get(next.dataset.rowKey);
+      if (existing) {
+        $$('details', existing).forEach((details, index) => {
+          if (details.open && $$('details', next)[index]) {
+            $$('details', next)[index].open = true;
+          }
+        });
+      }
+      const node = existing?.outerHTML === next.outerHTML ? existing : next;
+      if (node !== cursor) {
+        host.insertBefore(node, cursor);
+      }
+      cursor = node.nextElementSibling;
+    }
+    while (cursor) {
+      const next = cursor.nextElementSibling;
+      cursor.remove();
+      cursor = next;
+    }
+    if (focused && !focused.isConnected) {
+      const replacement = focusAttributes.length
+        ? $$('button, a', host).find((candidate) =>
+            focusAttributes.every(
+              ({ name, value }) => candidate.getAttribute(name) === value
+            )
+          )
+        : null;
+      const fallback = $('.section-caption button', host.parentElement);
+      (replacement || fallback)?.focus({ preventScroll: true });
+    }
+  }
+
+  function resourceMarkup(host, markup) {
+    if (!host.querySelector('.section-caption')) {
+      host.innerHTML = markup;
+      return;
+    }
+    const template = document.createElement('template');
+    template.innerHTML = markup;
+    $('.section-caption span', host).textContent = $(
+      '.section-caption span',
+      template.content
+    ).textContent;
+    patchRows(
+      $('section.list', host),
+      $('section.list', template.content).innerHTML
+    );
+  }
+
   function navigate(hash) {
     if (location.hash !== hash) {
       history.pushState(null, '', hash);
@@ -161,9 +315,19 @@
         );
         close();
         toast(identity ? '名称已更新' : 'Identity 已创建');
-        if (identity) {
-          await renderPage();
+        identitiesRevision++;
+        identitiesRequest?.controller.abort();
+        identitiesRequest = null;
+        const index = identities.findIndex(
+          (candidate) => candidate.id === result.id
+        );
+        if (index < 0) {
+          identities.push(result);
         } else {
+          identities[index] = result;
+        }
+        updateIdentityNames();
+        if (!identity) {
           navigate(identityRoute(result.id));
         }
       }
@@ -179,6 +343,13 @@
         '此操作无法撤销。',
       action: async () => {
         await api(identityAPIPath(identity.id), { method: 'DELETE' });
+        identitiesRevision++;
+        identitiesRequest?.controller.abort();
+        identitiesRequest = null;
+        identities = identities.filter(
+          (candidate) => candidate.id !== identity.id
+        );
+        tabCache.delete(identity.id);
         toast('Identity 及关联数据已删除');
         navigate('#/identities');
       }
@@ -187,7 +358,7 @@
 
   function renderIdentityRow(identity) {
     return /* HTML */ `
-      <div class="identity-row">
+      <div class="identity-row" data-row-key="${esc(identity.id)}">
         <div class="identity-icon" aria-hidden="true">
           ${esc(identity.name.slice(0, 1).toUpperCase())}
         </div>
@@ -231,26 +402,105 @@
       ) +
       /* HTML */ `
         <div class="section-caption">
-          <span>${identities.length} 个身份</span>
+          <span id="identity-count"></span>
           <span>独立授权 · 独立事件空间</span>
         </div>
-        <section class="list" aria-label="Identity 列表">
-          ${
-            identities.length
-              ? identities.map(renderIdentityRow).join('')
-              : renderEmptyState(
-                  '从一个身份开始',
-                  '新建 Identity 后，可以配置 Webhook，或让 Agent 在 OAuth 授权时选择它。',
-                  '<button class="button" id="empty-create">新建 Identity</button>'
-                )
-          }
-        </section>
+        <section
+          class="list"
+          id="identity-list"
+          aria-label="Identity 列表"
+        ></section>
         <p class="bottom-note">
           Identity 是 Agent 的权限边界。同一个身份可以授权给多个客户端。
         </p>
       `;
     $('#create-identity').onclick = () => openIdentityForm();
-    $('#empty-create')?.addEventListener('click', () => openIdentityForm());
+    updateIdentityNames();
+  }
+
+  function updateIdentityNames() {
+    const list = $('#identity-list');
+    if (list && identitiesLoaded) {
+      $('#identity-count').textContent = `${identities.length} 个身份`;
+      patchRows(
+        list,
+        identities.length
+          ? identities.map(renderIdentityRow).join('')
+          : renderEmptyState(
+              '从一个身份开始',
+              '新建 Identity 后，可以配置 Webhook，或让 Agent 在 OAuth 授权时选择它。',
+              '<button class="button" id="empty-create">新建 Identity</button>'
+            )
+      );
+      $('#empty-create')?.addEventListener('click', () => openIdentityForm());
+    }
+    if (currentView?.identityId) {
+      const identity = identities.find(
+        (candidate) => candidate.id === currentView.identityId
+      );
+      if (identity) {
+        $('.page-head h1').textContent = identity.name;
+        $('.page-head p').textContent = '创建于 ' + date(identity.created_at);
+        $('.breadcrumb span:last-child').textContent = identity.name;
+        $('#rename-identity').disabled = false;
+        $('#delete-identity').disabled = false;
+        $('#rename-identity').onclick = () => openIdentityForm(identity);
+        $('#delete-identity').onclick = () => deleteIdentity(identity);
+      }
+    }
+    eventsState?.updateIdentityFilter();
+  }
+
+  function requestIdentities() {
+    if (identitiesRequest) {
+      return identitiesRequest.promise;
+    }
+    const controller = new AbortController();
+    const revision = identitiesRevision;
+    const request = { controller };
+    request.promise = api('/api/identities', { signal: controller.signal })
+      .then((data) => {
+        if (revision === identitiesRevision && !controller.signal.aborted) {
+          identities = data.identities || [];
+          identitiesLoaded = true;
+          updateIdentityNames();
+        }
+      })
+      .finally(() => {
+        if (identitiesRequest === request) {
+          identitiesRequest = null;
+        }
+      });
+    identitiesRequest = request;
+    return request.promise;
+  }
+
+  function refreshIdentities() {
+    const host = $('#identity-list') || $('#identity-summary');
+    if (host) {
+      return loadRegion(
+        host,
+        'Identity',
+        () => requestIdentities(),
+        () => {
+          if (
+            currentView?.identityId &&
+            !identities.some(
+              (identity) => identity.id === currentView.identityId
+            )
+          ) {
+            host.innerHTML = renderEmptyState(
+              '找不到这个 Identity',
+              '它可能已被删除。'
+            );
+          }
+        },
+        identitiesLoaded,
+        { background: !!currentView?.identityId && identitiesLoaded }
+      );
+    }
+    // Events do not depend on the identity directory to start loading their history.
+    return eventsState?.refreshIdentities();
   }
   const tabs = [
     ['webhooks', 'Webhooks'],
@@ -268,86 +518,123 @@
     `;
   }
 
-  async function renderIdentity(identityId, tab, renderGeneration) {
-    const identity = identities.find(
-      (candidateIdentity) => candidateIdentity.id === identityId
-    );
-    if (!identity) {
-      main.innerHTML = renderEmptyState(
-        '找不到这个 Identity',
-        '它可能已被删除。',
-        '<a class="button" href="#/identities">返回身份列表</a>'
+  function renderIdentity(identityId, tab) {
+    if (currentView?.identityId !== identityId) {
+      currentView = { page: 'identities', identityId };
+      const identity = identities.find(
+        (candidate) => candidate.id === identityId
       );
-      return;
+      main.innerHTML =
+        renderIdentityBreadcrumb(identity || { name: 'Identity' }) +
+        renderPageHeader(
+          identity?.name || 'Identity',
+          identity ? '创建于 ' + date(identity.created_at) : '',
+          /* HTML */ `
+            <div class="actions">
+              <button id="rename-identity" class="button" disabled>
+                重命名
+              </button>
+              <button id="delete-identity" class="button quiet danger" disabled>
+                删除 Identity
+              </button>
+            </div>
+          `
+        ) +
+        /* HTML */ `
+          <div id="identity-summary"></div>
+          <nav class="tabs" aria-label="Identity 详情">
+            ${tabs
+              .map(
+                ([value, label]) => /* HTML */ `
+                  <a
+                    href="${identityRoute(identityId)}/${value}"
+                    data-tab="${value}"
+                  >
+                    ${label}
+                  </a>
+                `
+              )
+              .join('')}
+          </nav>
+          <div id="tab-content" class="data-region"></div>
+        `;
+      updateIdentityNames();
     }
-    if (!tabs.some((tabDefinition) => tabDefinition[0] === tab)) {
+    if (!tabs.some(([value]) => value === tab)) {
       tab = 'webhooks';
     }
-    main.innerHTML =
-      renderIdentityBreadcrumb(identity) +
-      renderPageHeader(
-        identity.name,
-        '创建于 ' + date(identity.created_at),
-        /* HTML */ `
-          <div class="actions">
-            <button id="rename-identity" class="button">重命名</button>
-            <button id="delete-identity" class="button quiet danger">
-              删除 Identity
-            </button>
-          </div>
-        `
-      ) +
-      /* HTML */ `
-        <nav class="tabs" aria-label="Identity 详情">
-          ${tabs
-            .map(
-              ([value, label]) => /* HTML */ `
-                <a
-                  href="${identityRoute(identityId)}/${value}"
-                  ${tab === value ? 'aria-current="page"' : ''}
-                >
-                  ${label}
-                </a>
-              `
-            )
-            .join('')}
-        </nav>
-        <div id="tab-content">
-          <div class="loading" role="status">
-            正在加载${esc(tabs.find((tabDefinition) => tabDefinition[0] === tab)[1])}…
-          </div>
-        </div>
-      `;
-    $('#rename-identity').onclick = () => openIdentityForm(identity);
-    $('#delete-identity').onclick = () => deleteIdentity(identity);
-    try {
-      const data = await api(identityAPIPath(identityId) + '/' + tab);
-      if (renderGeneration !== generation) {
-        return;
+    $$('.tabs a').forEach((link) => {
+      if (link.dataset.tab === tab) {
+        link.setAttribute('aria-current', 'page');
+      } else {
+        link.removeAttribute('aria-current');
       }
-      const content = $('#tab-content');
-      ({
-        webhooks: renderWebhooks,
-        channels: renderChannels,
-        authorizations: renderAuthorizations,
-        subscriptions: renderSubscriptions
-      })[tab](content, identityId, data[tab] || []);
-    } catch (requestError) {
-      if (renderGeneration === generation && requestError.status !== 401) {
-        $('#tab-content').innerHTML = /* HTML */ `
-          <div class="notice warning">
-            <p class="error" role="alert">${esc(requestError.message)}</p>
-            <button class="button" id="retry-tab">重新加载</button>
-          </div>
-        `;
+    });
+    const content = $('#tab-content');
+    if (currentView.tab !== tab) {
+      cancelRegion(content);
+      regions.forEach((request, host) => {
+        if (content.contains(host)) {
+          cancelRegion(host);
+        }
+      });
+      content.replaceChildren();
+      currentView.tab = tab;
+      const cached = tabCache.get(identityId)?.[tab];
+      if (cached) {
+        drawTab(content, identityId, tab, cached);
       }
-      $('#retry-tab')?.addEventListener('click', renderPage);
     }
+    return refreshTab(identityId, tab, false);
+  }
+
+  function drawTab(host, identityId, tab, items) {
+    ({
+      webhooks: renderWebhooks,
+      channels: renderChannels,
+      authorizations: renderAuthorizations,
+      subscriptions: renderSubscriptions
+    })[tab](host, identityId, items);
+  }
+
+  function refreshTab(identityId, tab, invalidate = true) {
+    const cached = tabCache.get(identityId) || {};
+    if (invalidate) {
+      delete cached[tab];
+    }
+    tabCache.set(identityId, cached);
+    if (currentView?.identityId !== identityId || currentView.tab !== tab) {
+      return;
+    }
+    const content = $('#tab-content');
+    const list = $('section.list', content);
+    return loadRegion(
+      list || content,
+      tabs.find(([value]) => value === tab)[1],
+      (signal) => api(identityAPIPath(identityId) + '/' + tab, { signal }),
+      (data) => {
+        const items = data[tab] || [];
+        cached[tab] = items;
+        drawTab(content, identityId, tab, items);
+        const identity = identities.find(
+          (candidate) => candidate.id === identityId
+        );
+        const countField = {
+          webhooks: 'webhook_count',
+          channels: 'channel_count',
+          authorizations: 'authorization_count'
+        }[tab];
+        if (identity && countField) {
+          identity[countField] = items.length;
+        }
+      },
+      !!list
+    );
   }
   // Webhook management and one-time keys
   function renderWebhookRow(webhook) {
     return /* HTML */ `
-      <article class="resource">
+      <article class="resource" data-row-key="${esc(webhook.id)}">
         <div class="resource-head">
           <div>
             <div class="resource-heading">
@@ -399,7 +686,7 @@
   }
 
   function renderWebhooks(host, identityId, items) {
-    host.innerHTML = /* HTML */ `
+    resourceMarkup(host, /* HTML */ `
       <div class="section-caption">
         <span>${items.length} 个事件来源</span>
         <button class="button primary" id="create-webhook">
@@ -416,10 +703,10 @@
               )
         }
       </section>
-    `;
+    `);
     const find = (webhookId) =>
       items.find((candidateWebhook) => candidateWebhook.id === webhookId);
-    $('#create-webhook').onclick = () => openWebhookForm(identityId);
+    $('#create-webhook', host).onclick = () => openWebhookForm(identityId);
     $$('[data-wh-copy]', host).forEach(
       (button) => (button.onclick = () => copy(find(button.dataset.whCopy).url))
     );
@@ -445,7 +732,7 @@
                 { method: 'DELETE' }
               );
               toast('Webhook 已删除');
-              await renderPage();
+              refreshTab(identityId, 'webhooks');
             }
           });
         })
@@ -468,7 +755,7 @@
                 { method: 'POST' }
               );
               showWebhookKey(result);
-              await renderPage();
+              refreshTab(identityId, 'webhooks');
             }
           });
         })
@@ -514,7 +801,7 @@
         } else {
           showWebhookKey(result);
         }
-        await renderPage();
+        refreshTab(identityId, 'webhooks');
       }
     );
   }
@@ -574,7 +861,7 @@
   const modeNames = { all: '全部事件', include: '仅包含', exclude: '排除名单' };
   function renderChannelRow(channel) {
     return /* HTML */ `
-      <article class="resource">
+      <article class="resource" data-row-key="${esc(channel.id)}">
         <div class="resource-head">
           <div>
             <div class="resource-heading">
@@ -635,7 +922,7 @@
   }
 
   function renderChannels(host, identityId, items) {
-    host.innerHTML = /* HTML */ `
+    resourceMarkup(host, /* HTML */ `
       <div class="section-caption">
         <span>${items.length} 个投递通道</span>
         <button class="button primary" id="create-channel">
@@ -653,8 +940,8 @@
         }
       </section>
       <p class="bottom-note">平台广播始终投递，不受 Channel 过滤规则影响。</p>
-    `;
-    $('#create-channel').onclick = () => openChannelForm(identityId);
+    `);
+    $('#create-channel', host).onclick = () => openChannelForm(identityId);
     $$('[data-channel-edit]', host).forEach(
       (button) =>
         (button.onclick = () =>
@@ -684,7 +971,7 @@
                 { method: 'DELETE' }
               );
               toast('Channel 已删除');
-              await renderPage();
+              refreshTab(identityId, 'channels');
             }
           });
         })
@@ -776,7 +1063,7 @@
         );
         close();
         toast('Channel 已保存，过滤规则立即生效');
-        await renderPage();
+        refreshTab(identityId, 'channels');
       }
     );
     function drawChips() {
@@ -866,7 +1153,7 @@
         `
       : '';
     return /* HTML */ `
-      <article class="resource">
+      <article class="resource" data-row-key="${esc(authorization.id)}">
         <div class="resource-head">
           <div>
             <div class="resource-heading">
@@ -896,7 +1183,7 @@
   }
 
   function renderAuthorizations(host, identityId, items) {
-    host.innerHTML = /* HTML */ `
+    resourceMarkup(host, /* HTML */ `
       <div class="section-caption">
         <span>${items.length} 条 OAuth 授权</span>
         <span>每条授权独立撤销</span>
@@ -911,7 +1198,7 @@
               )
         }
       </section>
-    `;
+    `);
     $$('[data-auth-delete]', host).forEach(
       (button) =>
         (button.onclick = () => {
@@ -933,7 +1220,7 @@
                 { method: 'DELETE' }
               );
               toast('授权已撤销');
-              await renderPage();
+              refreshTab(identityId, 'authorizations');
             }
           });
         })
@@ -949,7 +1236,7 @@
           : '';
 
     return /* HTML */ `
-      <article class="resource">
+      <article class="resource" data-row-key="${esc(subscription.id)}">
         <div class="resource-head">
           <div class="resource-heading">
             <h3 class="mono">${esc(subscription.channel)}</h3>
@@ -990,7 +1277,7 @@
       expired: '已过期',
       terminated: '已终止'
     };
-    host.innerHTML = /* HTML */ `
+    resourceMarkup(host, /* HTML */ `
       <div class="section-caption">
         <span>${items.length} 个 webhook 投递订阅</span>
         <span>由 Agent 通过 MCP 创建</span>
@@ -1009,7 +1296,7 @@
               )
         }
       </section>
-    `;
+    `);
     $$('[data-sub-delete]', host).forEach(
       (button) =>
         (button.onclick = () =>
@@ -1025,7 +1312,7 @@
                 { method: 'DELETE' }
               );
               toast('订阅已删除');
-              await renderPage();
+              refreshTab(identityId, 'subscriptions');
             }
           }))
     );
@@ -1048,6 +1335,7 @@
     return /* HTML */ `
       <button
         type="button"
+        data-row-key="${esc(eventRecord.seq)}"
         class="event-row ${eventRecord.kind === 'system' ? 'system' : ''}"
         data-event="${esc(eventRecord.id)}"
         aria-label="查看事件 ${esc(eventRecord.identifier)} #${eventRecord.seq}"
@@ -1091,213 +1379,295 @@
     `;
   }
 
-  async function renderEvents(params, renderGeneration) {
-    const selected = params.get('identity_id') || '';
-    const identifier = params.get('identifier') || '';
-    const options = [
-      { value: '', label: '全部身份' },
-      { value: '_broadcast', label: '仅平台广播' },
-      ...identities.map((identity) => ({
-        value: identity.id,
-        label: identity.name
-      }))
-    ];
-    const selectedName =
-      options.find((option) => option.value === selected)?.label || '未知身份';
-    main.innerHTML =
-      renderPageHeader(
-        '事件流',
-        '查看接收到的原始请求与平台广播，新事件会实时进入列表。'
-      ) +
-      /* HTML */ `
-        <div class="filters">
-          <button
-            id="identity-filter"
-            class="button"
-            aria-label="按 Identity 过滤"
-            aria-haspopup="menu"
-            aria-expanded="false"
-          >
-            ${esc(selectedName)}
-            <span aria-hidden="true">⌄</span>
-          </button>
-          <form id="event-filter">
-            <input
-              name="identifier"
-              value="${esc(identifier)}"
-              placeholder="按 identifier 过滤"
-              aria-label="按 identifier 过滤"
-            />
-            <button class="button" type="submit">筛选</button>
-            ${identifier ? '<button class="button quiet" type="button" id="clear-event-filter">清除</button>' : ''}
-          </form>
-          <span class="stream-state" id="stream-state">
-            <span class="dot"></span>
-            正在连接
-          </span>
-        </div>
-        <div class="section-caption">
-          <span id="event-count">正在读取事件…</span>
-          <button class="button quiet small" id="refresh-events">刷新</button>
-        </div>
-        <section class="list" id="event-list" aria-label="事件列表">
-          <div class="loading" style="padding:24px" role="status">
-            正在加载事件…
+  function renderEvents(params) {
+    if (currentView?.page !== 'events') {
+      currentView = { page: 'events' };
+      main.innerHTML =
+        renderPageHeader(
+          '事件流',
+          '查看接收到的原始请求与平台广播，新事件会实时进入列表。'
+        ) +
+        /* HTML */ `
+          <div class="filters">
+            <div id="identity-filter-region">
+              <button
+                id="identity-filter"
+                class="button"
+                aria-label="按 Identity 过滤"
+                aria-haspopup="menu"
+                aria-expanded="false"
+              >
+                全部身份
+              </button>
+            </div>
+            <form id="event-filter">
+              <input
+                name="identifier"
+                placeholder="按 identifier 过滤"
+                aria-label="按 identifier 过滤"
+              />
+              <button class="button" type="submit">筛选</button>
+              <button
+                class="button quiet"
+                type="button"
+                id="clear-event-filter"
+                hidden
+              >
+                清除
+              </button>
+            </form>
+            <span class="stream-state" id="stream-state" role="status">
+              <span class="dot"></span>正在连接
+            </span>
           </div>
-        </section>
-        <div id="event-pagination" class="load-more"></div>
-      `;
+          <div class="section-caption">
+            <span id="event-count" role="status"></span>
+            <button class="button quiet small" id="refresh-events">刷新</button>
+          </div>
+          <section
+            class="list data-region"
+            id="event-list"
+            aria-label="事件列表"
+          >
+            <div id="event-rows"></div>
+          </section>
+          <div id="event-pagination" class="load-more"></div>
+        `;
+      eventsState = createEventsState();
+    }
+    eventsState.setFilters(params);
+  }
+
+  function createEventsState() {
+    const list = $('#event-list');
+    const rows = $('#event-rows');
+    const pagination = $('#event-pagination');
     const state = {
-      selected,
-      identifier,
+      selected: '',
+      identifier: '',
       items: [],
       next: null,
       loaded: false,
       pending: [],
-      busy: false,
-      gen: renderGeneration
+      key: null,
+      refreshing: false
     };
-    eventsState = state;
-    function filterRoute(identity, identifierFilter) {
-      const queryParameters = new URLSearchParams();
-      if (identity) {
-        queryParameters.set('identity_id', identity);
-      }
-      if (identifierFilter) {
-        queryParameters.set('identifier', identifierFilter);
-      }
-      navigate(
-        '#/events' +
-          (queryParameters.size ? '?' + queryParameters.toString() : '')
+    const active = () => eventsState === state && list.isConnected;
+    function options() {
+      return [
+        { value: '', label: '全部身份' },
+        { value: '_broadcast', label: '仅平台广播' },
+        ...identities.map((identity) => ({
+          value: identity.id,
+          label: identity.name
+        }))
+      ];
+    }
+    state.updateIdentityFilter = () => {
+      $('#identity-filter').textContent =
+        (options().find((option) => option.value === state.selected)?.label ||
+          '未知身份') + ' ⌄';
+    };
+    state.refreshIdentities = () =>
+      loadRegion(
+        $('#identity-filter-region'),
+        'Identity 选项',
+        () => requestIdentities(),
+        () => {},
+        identitiesLoaded,
+        { background: identitiesLoaded }
       );
+    function filterRoute(selected, identifier) {
+      const query = new URLSearchParams();
+      if (selected) {
+        query.set('identity_id', selected);
+      }
+      if (identifier) {
+        query.set('identifier', identifier);
+      }
+      navigate('#/events' + (query.size ? '?' + query : ''));
     }
     $('#identity-filter').onclick = (event) =>
-      menu(event.currentTarget, options, selected, (value) =>
-        filterRoute(value, identifier)
+      menu(event.currentTarget, options(), state.selected, (value) =>
+        filterRoute(value, state.identifier)
       );
     $('#event-filter').onsubmit = (event) => {
       event.preventDefault();
       filterRoute(
-        selected,
+        state.selected,
         String(new FormData(event.currentTarget).get('identifier')).trim()
       );
     };
-    $('#clear-event-filter')?.addEventListener('click', () =>
-      filterRoute(selected, '')
-    );
-    $('#refresh-events').onclick = renderPage;
+    $('#clear-event-filter').onclick = () => filterRoute(state.selected, '');
+    $('#refresh-events').onclick = () => refresh();
     function matches(eventRecord) {
       return (
-        (!selected ||
-          (selected === '_broadcast'
+        (!state.selected ||
+          (state.selected === '_broadcast'
             ? eventRecord.identity_id === null
-            : eventRecord.identity_id === selected)) &&
-        (!identifier || eventRecord.identifier === identifier)
+            : eventRecord.identity_id === state.selected)) &&
+        (!state.identifier || eventRecord.identifier === state.identifier)
       );
     }
-    function merge(list) {
-      const map = new Map(
+    function merge(items) {
+      const records = new Map(
         state.items.map((eventRecord) => [eventRecord.seq, eventRecord])
       );
-      list
+      items
         .filter(matches)
-        .forEach((eventRecord) => map.set(eventRecord.seq, eventRecord));
-      state.items = [...map.values()].sort(
-        (leftEvent, rightEvent) => rightEvent.seq - leftEvent.seq
+        .forEach((eventRecord) => records.set(eventRecord.seq, eventRecord));
+      state.items = [...records.values()].sort(
+        (left, right) => right.seq - left.seq
       );
     }
-    function draw() {
-      if (renderGeneration !== generation) {
+    function drawRows() {
+      if (!active()) {
         return;
       }
       $('#event-count').textContent =
         `已加载 ${state.items.length} 条事件 · 按接收时间倒序`;
-      $('#event-list').innerHTML = state.items.length
-        ? renderEventColumnLabels() + state.items.map(renderEventRow).join('')
-        : renderEmptyState(
-            '没有匹配的事件',
-            '调整过滤条件，或向 Webhook 发送一次请求。新的事件会自动出现在这里。'
-          );
-      $$('[data-event]', $('#event-list')).forEach(
-        (button) =>
-          (button.onclick = () =>
-            eventDetail(
-              state.items.find(
-                (eventRecord) => eventRecord.id === button.dataset.event
-              )
-            ))
+      patchRows(
+        rows,
+        state.items.length
+          ? renderEventColumnLabels() + state.items.map(renderEventRow).join('')
+          : renderEmptyState(
+              '没有匹配的事件',
+              '调整过滤条件，或向 Webhook 发送一次请求。新的事件会自动出现在这里。'
+            )
       );
-      $('#event-pagination').innerHTML =
-        state.next !== null
-          ? /* HTML */ `
-              <button
-                class="button"
-                id="load-more"
-                ${state.busy ? 'disabled' : ''}
-              >
-                ${state.busy ? '正在加载…' : '加载更多历史事件'}
-              </button>
-            `
-          : state.items.length
+      $$('[data-event]', rows).forEach((button) => {
+        button.onclick = () =>
+          eventDetail(
+            state.items.find((record) => record.id === button.dataset.event)
+          );
+      });
+    }
+    function drawPagination() {
+      if (state.next !== null) {
+        if (!$('#load-more')) {
+          pagination.innerHTML =
+            '<button class="button" id="load-more">加载更多历史事件</button>';
+        }
+        $('#load-more').disabled = state.refreshing;
+        $('#load-more').onclick = loadMore;
+      } else {
+        pagination.innerHTML =
+          state.items.length && !state.refreshing
             ? '<span class="hint">已显示全部历史事件</span>'
             : '';
-      $('#load-more')?.addEventListener('click', loadMore);
+      }
     }
     function query(before) {
-      const queryParameters = new URLSearchParams({ limit: '50' });
-      if (selected) {
-        queryParameters.set('identity_id', selected);
+      const params = new URLSearchParams({ limit: '50' });
+      if (state.selected) {
+        params.set('identity_id', state.selected);
       }
-      if (identifier) {
-        queryParameters.set('identifier', identifier);
+      if (state.identifier) {
+        params.set('identifier', state.identifier);
       }
       if (before !== undefined) {
-        queryParameters.set('before', String(before));
+        params.set('before', String(before));
       }
-      return '/api/events?' + queryParameters;
+      return '/api/events?' + params;
     }
     async function loadMore() {
-      if (state.busy || state.next === null) {
+      if (regions.has(pagination) || state.refreshing || state.next === null) {
         return;
       }
-      state.busy = true;
-      draw();
-      try {
-        const data = await api(query(state.next));
-        if (renderGeneration !== generation) {
-          return;
-        }
-        merge(data.events || []);
-        state.next = data.next_before ?? null;
-        draw();
-      } catch (requestError) {
-        if (requestError.status !== 401) {
-          toast('加载历史事件失败：' + requestError.message);
-        }
-      } finally {
-        state.busy = false;
-        if (renderGeneration === generation) {
-          draw();
+      const url = query(state.next);
+      $('#load-more').disabled = true;
+      await loadRegion(
+        pagination,
+        '历史事件',
+        (signal) => api(url, { signal }),
+        (data) => {
+          merge(data.events || []);
+          state.next = data.next_before ?? null;
+          drawRows();
+          drawPagination();
+        },
+        true,
+        { retry: loadMore }
+      );
+      if (active()) {
+        const button = $('#load-more');
+        if (button) {
+          button.disabled = state.refreshing;
         }
       }
     }
-    const streamURL =
-      '/api/events/stream' +
-      (selected && selected !== '_broadcast'
-        ? '?identity_id=' + encodeURIComponent(selected)
-        : '');
-    eventSource = new EventSource(streamURL);
+    function refresh() {
+      cancelRegion(pagination);
+      pagination.querySelector('.region-error')?.remove();
+      state.refreshing = true;
+      state.pending = [];
+      drawPagination();
+      const url = query();
+      return loadRegion(
+        list,
+        '事件',
+        async (signal) => {
+          try {
+            return await api(url, { signal });
+          } catch (error) {
+            if (!signal.aborted && active()) {
+              if (!state.loaded) {
+                state.items = [];
+              }
+              state.loaded = true;
+              state.refreshing = false;
+              merge(state.pending);
+              state.pending = [];
+              if (state.items.length) {
+                drawRows();
+              }
+              $('#event-count').textContent = '读取事件失败，可在列表中重试';
+              drawPagination();
+            }
+            throw error;
+          }
+        },
+        (data) => {
+          state.items = [];
+          merge([...(data.events || []), ...state.pending]);
+          state.pending = [];
+          state.loaded = true;
+          state.refreshing = false;
+          state.next = data.next_before ?? null;
+          drawRows();
+          drawPagination();
+        },
+        rows.children.length > 0,
+        { retry: refresh }
+      );
+    }
+    state.setFilters = (params) => {
+      const selected = params.get('identity_id') || '';
+      const identifier = params.get('identifier') || '';
+      const key = JSON.stringify([selected, identifier]);
+      if (key !== state.key) {
+        state.key = key;
+        state.selected = selected;
+        state.identifier = identifier;
+        state.loaded = false;
+        state.next = null;
+        $('#event-filter input').value = identifier;
+        $('#clear-event-filter').hidden = !identifier;
+        state.updateIdentityFilter();
+      }
+      refresh();
+    };
+    eventSource = new EventSource('/api/events/stream');
     const stream = eventSource;
     let checking = false;
     stream.onopen = () => {
-      if (renderGeneration !== generation) {
-        return;
+      if (active()) {
+        $('#stream-state').dataset.connected = 'true';
+        $('#stream-state').innerHTML = '<span class="dot"></span>实时连接';
       }
-      $('#stream-state').dataset.connected = 'true';
-      $('#stream-state').innerHTML = '<span class="dot"></span>实时连接';
     };
     stream.addEventListener('event', (message) => {
-      if (renderGeneration !== generation) {
+      if (!active()) {
         return;
       }
       try {
@@ -1305,20 +1675,19 @@
         if (!matches(eventRecord)) {
           return;
         }
-        if (!state.loaded) {
+        if (state.refreshing) {
           state.pending.push(eventRecord);
-        } else {
+        }
+        if (state.loaded || rows.children.length) {
           merge([eventRecord]);
-          draw();
+          drawRows();
         }
       } catch {
-        if (renderGeneration === generation) {
-          toast('收到无法解析的事件，请刷新重试。');
-        }
+        toast('收到无法解析的事件，请刷新重试。');
       }
     });
     stream.onerror = async () => {
-      if (renderGeneration !== generation) {
+      if (!active()) {
         return;
       }
       $('#stream-state').dataset.connected = 'false';
@@ -1328,37 +1697,16 @@
       }
       checking = true;
       try {
-        await api('/api/identities');
-      } catch (requestError) {
-        if (requestError.status === 401) {
+        await requestIdentities();
+      } catch (error) {
+        if (error.status === 401) {
           stream.close();
         }
       } finally {
         checking = false;
       }
     };
-    try {
-      const data = await api(query());
-      if (renderGeneration !== generation) {
-        return;
-      }
-      merge([...(data.events || []), ...state.pending]);
-      state.pending = [];
-      state.loaded = true;
-      state.next = data.next_before ?? null;
-      draw();
-    } catch (requestError) {
-      if (renderGeneration === generation && requestError.status !== 401) {
-        state.loaded = true;
-        $('#event-list').innerHTML = renderEmptyState(
-          '暂时无法读取事件',
-          esc(requestError.message),
-          '<button class="button" id="retry-events">重新加载</button>'
-        );
-        $('#event-count').textContent = '加载失败';
-        $('#retry-events').onclick = renderPage;
-      }
-    }
+    return state;
   }
 
   function eventDetail(eventRecord) {
@@ -1581,65 +1929,54 @@
     });
   }
   // Hash routing and application startup
-  async function renderPage() {
-    const renderGeneration = ++generation;
-    eventSource?.close();
-    eventSource = null;
-    eventsState = null;
+  function renderPage() {
     const fragment = location.hash.slice(1) || '/identities';
     const [pathname, search = ''] = fragment.split('?');
     const parts = pathname.split('/').filter(Boolean);
     const page = parts[0] || 'identities';
-    $$('.sidebar [data-nav]').forEach((navLink) => {
-      if (navLink.dataset.nav === page) {
-        navLink.setAttribute('aria-current', 'page');
+    const identityId =
+      page === 'identities' && parts[1] ? decodeURIComponent(parts[1]) : null;
+    const sameShell =
+      currentView?.page === page &&
+      (currentView.identityId || null) === identityId;
+    if (!sameShell) {
+      regions.forEach((request, host) => cancelRegion(host));
+      eventSource?.close();
+      eventSource = null;
+      eventsState = null;
+      currentView = null;
+    }
+    $$('.sidebar [data-nav]').forEach((link) => {
+      if (link.dataset.nav === page) {
+        link.setAttribute('aria-current', 'page');
       } else {
-        navLink.removeAttribute('aria-current');
+        link.removeAttribute('aria-current');
       }
     });
-    main.setAttribute('aria-busy', 'true');
-    main.innerHTML =
-      '<div class="loading" role="status">正在加载工作空间…</div>';
-    try {
-      const data = await api('/api/identities');
-      if (renderGeneration !== generation) {
-        return;
+    if (identityId) {
+      renderIdentity(identityId, parts[2] || 'webhooks');
+    } else if (page === 'identities') {
+      if (!sameShell) {
+        currentView = { page };
+        renderIdentities();
       }
-      identities = data.identities || [];
-      if (page === 'identities') {
-        if (parts[1]) {
-          await renderIdentity(
-            decodeURIComponent(parts[1]),
-            parts[2] || 'webhooks',
-            renderGeneration
-          );
-        } else {
-          renderIdentities();
-        }
-      } else if (page === 'events') {
-        await renderEvents(new URLSearchParams(search), renderGeneration);
-      } else if (page === 'broadcast') {
+    } else if (page === 'events') {
+      renderEvents(new URLSearchParams(search));
+    } else if (page === 'broadcast') {
+      if (!sameShell) {
+        currentView = { page };
         renderBroadcast();
-      } else {
-        main.innerHTML = renderEmptyState(
-          '页面不存在',
-          '使用左侧导航继续管理工作空间。',
-          '<a class="button" href="#/identities">返回身份列表</a>'
-        );
       }
-    } catch (requestError) {
-      if (renderGeneration === generation && requestError.status !== 401) {
-        main.innerHTML = renderEmptyState(
-          '无法加载工作空间',
-          esc(requestError.message),
-          '<button id="retry-page" class="button">重新加载</button>'
-        );
-        $('#retry-page').onclick = renderPage;
-      }
-    } finally {
-      if (renderGeneration === generation) {
-        main.removeAttribute('aria-busy');
-      }
+    } else if (!sameShell) {
+      currentView = { page };
+      main.innerHTML = renderEmptyState(
+        '页面不存在',
+        '使用左侧导航继续管理工作空间。',
+        '<a class="button" href="#/identities">返回身份列表</a>'
+      );
+    }
+    if (!sameShell) {
+      refreshIdentities();
     }
   }
   api('/api/meta')
