@@ -294,6 +294,8 @@ func (s *Server) listAuthorizations(w http.ResponseWriter, r *http.Request) {
 		out[i] = map[string]any{
 			"id": a.ID, "client_id": a.ClientID, "client_name": a.ClientName, "redirect_host": oauth.RedirectHost(a.RedirectURI),
 			"created_at": events.Stamp(a.CreatedAt), "last_used_at": used,
+			"registration":  a.ClientKind,
+			"metadata_host": oauth.MetadataHost(store.Client{ID: a.ClientID, Kind: a.ClientKind}),
 		}
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"authorizations": out})
@@ -450,6 +452,9 @@ func (s *Server) getRequest(w http.ResponseWriter, r *http.Request) {
 		"id": p.Request.ID,
 		"client": map[string]any{
 			"id": p.Client.ID, "name": p.Client.Name, "redirect_uri": p.Request.RedirectURI, "redirect_host": host,
+			"registration":  p.Client.Kind,
+			"metadata_host": oauth.MetadataHost(p.Client),
+			"warnings":      oauth.ConsentWarnings(p.Client, p.Request.RedirectURI),
 		},
 		"scope": p.Request.Scope, "resource": p.Request.Resource, "expires_at": events.Stamp(p.Request.ExpiresAt),
 		"identities": idents,

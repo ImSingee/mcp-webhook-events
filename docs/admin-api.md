@@ -87,8 +87,13 @@ Channel 对象：
 
 Authorization 对象：
 ```json
-{"id":"auf_…","client_id":"…","client_name":"Claude Code","redirect_host":"localhost","created_at":"…","last_used_at":"…|null"}
+{"id":"auf_…","client_id":"…","client_name":"Claude Code","redirect_host":"localhost","created_at":"…","last_used_at":"…|null",
+ "registration":"dcr|cimd","metadata_host":"claude.ai|null"}
 ```
+- `registration`（新增）：客户端的注册方式。
+  - `dcr`：通过动态注册（`/oauth/register`）获得 client_id，`client_id` 是服务端生成的 `cli_…`。
+  - `cimd`：用客户端元数据文档（Client ID Metadata Document）的 https URL 作为 `client_id`，此时 `client_id` 就是这个 URL，`client_name` 取自服务端最近一次抓到并校验通过的文档。
+- `metadata_host`（新增）：`cimd` 时为 `client_id` URL 的 host（含非默认端口，例如 `claude.ai`、`app.example:8443`），表示这个客户端的元数据来自哪里；`dcr` 时为 `null`。
 - `GET /api/identities/{iid}/authorizations` → `{"authorizations":[Authorization]}`。
 - `DELETE /api/identities/{iid}/authorizations/{aid}` → `204`。立即撤销该授权的 access token 和 refresh token。
 
@@ -151,16 +156,27 @@ Event 对象：
 
 ## OAuth consent
 
-后端处理 `GET /oauth/authorize` 时，先校验参数（client、redirect_uri、PKCE、resource），然后把请求保存为待确认请求 `ar_…`，有效期 10 分钟，并 302 到 `/consent?request=ar_…`。如果参数校验失败且无法安全重定向，后端直接渲染一个简单的错误文本页，不需要前端参与。
+后端处理 `GET /oauth/authorize` 时，先校验参数（client、redirect_uri、PKCE、resource），然后把请求保存为待确认请求 `ar_…`，有效期 10 分钟，并 302 到 `/consent?request=ar_…`。如果参数校验失败且无法安全重定向，后端直接渲染一个简单的错误文本页，不需要前端参与。CIMD 客户端的元数据文档抓取失败或校验不通过时，也走这个错误页，不会到 consent 页。
 
 - `GET /api/oauth/requests/{id}` 返回：
   ```json
-  {"id":"ar_…","client":{"id":"…","name":"Claude Code","redirect_uri":"http://localhost:53122/callback","redirect_host":"localhost"},
+  {"id":"ar_…","client":{"id":"…","name":"Claude Code","redirect_uri":"http://localhost:53122/callback","redirect_host":"localhost",
+                         "registration":"dcr|cimd","metadata_host":"claude.ai|null",
+                         "warnings":[{"code":"localhost_redirect","message":"…"}]},
    "scope":"mcp","resource":"https://x/mcp","expires_at":"…",
    "identities":[{"id":"idn_…","name":"…","authorization_count":1}]}
   ```
   请求过期或不存在时返回 `404 not_found`。
+  - `client.registration`、`client.metadata_host`（新增）：含义同 Authorization 对象。`cimd` 时 `client.id` 是元数据文档的 URL，`client.name` 来自该文档，是客户端**自称**的名字。
+  - `client.warnings`（新增）：数组，总是存在（没有警告时为 `[]`）。每项 `{"code":"<snake_case>","message":"<英文说明>"}`。前端按 `code` 显示自己的文案，未知的 `code` 显示 `message`。目前只有一种：
+    - `localhost_redirect`：`cimd` 客户端要把用户送回本机地址（`http://localhost`、`127.0.0.1` 或 `[::1]`）。元数据文档无法阻止本机上的其他程序冒充这个客户端（MCP 2026-07-28 authorization「Localhost Redirect URI Risks」要求对此额外提示）。
 - `POST /api/oauth/requests/{id}/approve`，请求体 `{"identity_id":"idn_…"}` 或 `{"new_identity_name":"..."}`（二选一）→ `{"redirect_url":"<带 code/state/iss 的回调地址>"}`。前端收到后执行 `location.assign(redirect_url)`。
 - `POST /api/oauth/requests/{id}/deny` → `{"redirect_url":"<带 error=access_denied&state&iss 的回调地址>"}`。
 
 consent 页必须醒目展示 `client.name` 和 `redirect_host`；如果 `redirect_host` 是 loopback 地址，要注明“本机应用”。
+
+`registration` 为 `cimd` 时，consent 页还必须：
+- 在 `client.name` 旁醒目展示 `metadata_host`（CIMD §10.6：显示 client_id 的主机名，帮助用户确认授权的是预期的应用），并说明名称由该主机上的文档自称、未经平台审核；
+- 逐条展示 `client.warnings`。
+
+`logo_uri` 等文档里的图片地址不在 API 中返回：CIMD §10.9 要求服务端代为抓取并托管后才能展示，本服务目前不显示客户端 logo。

@@ -52,9 +52,9 @@ type Server struct {
 // Option adjusts the server's config or app before it starts.
 type Option func(*config.Config, *app.Options)
 
-// AllowPrivate turns on MWE_ALLOW_PRIVATE_CALLBACKS.
+// AllowPrivate turns on MWE_ALLOW_PRIVATE_NETWORK.
 func AllowPrivate() Option {
-	return func(c *config.Config, _ *app.Options) { c.AllowPrivateCallbacks = true }
+	return func(c *config.Config, _ *app.Options) { c.AllowPrivateNetwork = true }
 }
 
 // WithResolver replaces the delivery guard's DNS.
@@ -284,6 +284,19 @@ type Tokens struct {
 // returns the tokens.
 func (s *Server) Authorize(b *Browser, c *OAuthClient, identityID, newName string) Tokens {
 	s.T.Helper()
+	tok := s.AuthorizeRaw(b, c, identityID, newName)
+	refresh, _ := tok["refresh_token"].(string)
+	out := Tokens{Access: tok["access_token"].(string), Refresh: refresh}
+	m := s.MCP(out.Access)
+	who := m.Tool("whoami", nil)
+	out.IdentityID = who["identity"].(map[string]any)["id"].(string)
+	return out
+}
+
+// AuthorizeRaw runs the whole flow and returns the token response as it
+// came.
+func (s *Server) AuthorizeRaw(b *Browser, c *OAuthClient, identityID, newName string) map[string]any {
+	s.T.Helper()
 	verifier, challenge := PKCE()
 	red := b.Consent(c.AuthorizeURL(challenge, "", s.URL+"/mcp"), identityID, newName)
 	u, _ := url.Parse(red)
@@ -291,11 +304,7 @@ func (s *Server) Authorize(b *Browser, c *OAuthClient, identityID, newName strin
 	if st != http.StatusOK {
 		s.T.Fatalf("token: %d %v", st, tok)
 	}
-	out := Tokens{Access: tok["access_token"].(string), Refresh: tok["refresh_token"].(string)}
-	m := s.MCP(out.Access)
-	who := m.Tool("whoami", nil)
-	out.IdentityID = who["identity"].(map[string]any)["id"].(string)
-	return out
+	return tok
 }
 
 // NewAgent signs a new identity in and returns its MCP client.

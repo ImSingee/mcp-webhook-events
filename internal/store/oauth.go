@@ -17,7 +17,17 @@ var (
 	ErrReplay = errors.New("replayed")
 )
 
-// Client is an OAuth client registered by RFC 7591 dynamic registration.
+// Client registration kinds.
+const (
+	// ClientDCR is a client registered by RFC 7591 dynamic registration,
+	// with a client_id this server made.
+	ClientDCR = "dcr"
+	// ClientCIMD is a client identified by the https URL of its Client ID
+	// Metadata Document (draft-ietf-oauth-client-id-metadata-document).
+	ClientCIMD = "cimd"
+)
+
+// Client is an OAuth client.
 type Client struct {
 	ID              string
 	SecretHash      string // "" for a public client
@@ -26,9 +36,17 @@ type Client struct {
 	TokenAuthMethod string // none, client_secret_post or client_secret_basic
 	GrantTypes      []string
 	CreatedAt       time.Time
+	Kind            string // ClientDCR or ClientCIMD
+
+	// For a CIMD client, from the last document fetched and validated:
+	ClientURI          string
+	LogoURI            string
+	Metadata           json.RawMessage // the document as fetched
+	MetadataFetchedAt  *time.Time
+	MetadataFreshUntil *time.Time // fresh by its HTTP cache headers until then
 }
 
-// CreateClient registers a client.
+// CreateClient registers a dynamically registered client.
 func (s *Store) CreateClient(ctx context.Context, c Client) error {
 	uris, _ := json.Marshal(c.RedirectURIs)
 	grants, _ := json.Marshal(c.GrantTypes)
@@ -36,32 +54,83 @@ func (s *Store) CreateClient(ctx context.Context, c Client) error {
 	if c.SecretHash != "" {
 		secret = c.SecretHash
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO oauth_clients (client_id, client_secret_hash, client_name, redirect_uris, token_endpoint_auth_method, grant_types, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		c.ID, secret, c.Name, string(uris), c.TokenAuthMethod, string(grants), c.CreatedAt.UnixMilli())
+	_, err := s.db.ExecContext(ctx, `INSERT INTO oauth_clients (client_id, client_secret_hash, client_name, redirect_uris, token_endpoint_auth_method, grant_types, created_at, kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		c.ID, secret, c.Name, string(uris), c.TokenAuthMethod, string(grants), c.CreatedAt.UnixMilli(), ClientDCR)
+	return err
+}
+
+// PutCIMDClient saves a CIMD client's latest validated document, adding
+// the client the first time it is seen. It never touches a dynamically
+// registered client.
+func (s *Store) PutCIMDClient(ctx context.Context, c Client) error {
+	uris, _ := json.Marshal(c.RedirectURIs)
+	grants, _ := json.Marshal(c.GrantTypes)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO oauth_clients (client_id, client_secret_hash, client_name, redirect_uris, token_endpoint_auth_method, grant_types, created_at, kind, client_uri, logo_uri, metadata, metadata_fetched_at, metadata_fresh_until)
+VALUES (?, NULL, ?, ?, ?, ?, ?, 'cimd', ?, ?, ?, ?, ?)
+ON CONFLICT(client_id) DO UPDATE SET client_name = excluded.client_name, redirect_uris = excluded.redirect_uris,
+  token_endpoint_auth_method = excluded.token_endpoint_auth_method, grant_types = excluded.grant_types,
+  client_uri = excluded.client_uri, logo_uri = excluded.logo_uri, metadata = excluded.metadata,
+  metadata_fetched_at = excluded.metadata_fetched_at, metadata_fresh_until = excluded.metadata_fresh_until
+WHERE oauth_clients.kind = 'cimd'`,
+		c.ID, c.Name, string(uris), c.TokenAuthMethod, string(grants), s.nowMS(),
+		strOrNull(c.ClientURI), strOrNull(c.LogoURI), strOrNull(string(c.Metadata)), msPtr(c.MetadataFetchedAt), msPtr(c.MetadataFreshUntil))
 	return err
 }
 
 // GetClient is the client with that id.
 func (s *Store) GetClient(ctx context.Context, id string) (Client, error) {
 	var (
-		c            Client
-		secret       sql.NullString
-		uris, grants string
-		created      int64
+		c                                Client
+		secret, clientURI, logoURI, meta sql.NullString
+		uris, grants                     string
+		created                          int64
+		fetched, fresh                   sql.NullInt64
 	)
-	err := s.db.QueryRowContext(ctx, `SELECT client_id, client_secret_hash, client_name, redirect_uris, token_endpoint_auth_method, grant_types, created_at FROM oauth_clients WHERE client_id = ?`, id).
-		Scan(&c.ID, &secret, &c.Name, &uris, &c.TokenAuthMethod, &grants, &created)
+	err := s.db.QueryRowContext(ctx, `SELECT client_id, client_secret_hash, client_name, redirect_uris, token_endpoint_auth_method, grant_types, created_at, kind, client_uri, logo_uri, metadata, metadata_fetched_at, metadata_fresh_until FROM oauth_clients WHERE client_id = ?`, id).
+		Scan(&c.ID, &secret, &c.Name, &uris, &c.TokenAuthMethod, &grants, &created, &c.Kind, &clientURI, &logoURI, &meta, &fetched, &fresh)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Client{}, ErrNotFound
 	}
 	if err != nil {
 		return Client{}, err
 	}
-	c.SecretHash = secret.String
-	c.CreatedAt = at(created)
+	c.SecretHash, c.ClientURI, c.LogoURI = secret.String, clientURI.String, logoURI.String
+	if meta.Valid {
+		c.Metadata = json.RawMessage(meta.String)
+	}
+	c.CreatedAt, c.MetadataFetchedAt, c.MetadataFreshUntil = at(created), ms(fetched), ms(fresh)
 	_ = json.Unmarshal([]byte(uris), &c.RedirectURIs)
 	_ = json.Unmarshal([]byte(grants), &c.GrantTypes)
 	return c, nil
+}
+
+// RevokeClientFamilies revokes every live family of a client, with their
+// tokens, and returns their ids.
+func (s *Store) RevokeClientFamilies(ctx context.Context, clientID string) ([]string, error) {
+	now := s.nowMS()
+	var ids []string
+	err := s.inTx(ctx, func(tx *sql.Tx) error {
+		rows, err := tx.QueryContext(ctx, `SELECT id FROM oauth_families WHERE client_id = ? AND revoked_at IS NULL`, clientID)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return err
+			}
+			ids = append(ids, id)
+		}
+		rows.Close()
+		for _, id := range ids {
+			if err := revokeFamily(ctx, tx, id, now); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	return ids, err
 }
 
 // AuthRequest is a validated authorization request waiting for the user's
@@ -368,11 +437,12 @@ func (s *Store) RevokeTokenByHash(ctx context.Context, hash, clientID string) (f
 type Authorization struct {
 	Family
 	ClientName string
+	ClientKind string // ClientDCR or ClientCIMD
 }
 
 // ListAuthorizations is an identity's live families, oldest first.
 func (s *Store) ListAuthorizations(ctx context.Context, identityID string) ([]Authorization, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT `+familyCols+`, c.client_name FROM oauth_families f JOIN oauth_clients c ON c.client_id = f.client_id WHERE f.identity_id = ? AND f.revoked_at IS NULL ORDER BY f.created_at, f.id`, identityID)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+familyCols+`, c.client_name, c.kind FROM oauth_families f JOIN oauth_clients c ON c.client_id = f.client_id WHERE f.identity_id = ? AND f.revoked_at IS NULL ORDER BY f.created_at, f.id`, identityID)
 	if err != nil {
 		return nil, err
 	}
@@ -384,7 +454,7 @@ func (s *Store) ListAuthorizations(ctx context.Context, identityID string) ([]Au
 			created       int64
 			used, revoked sql.NullInt64
 		)
-		if err := rows.Scan(&a.ID, &a.IdentityID, &a.ClientID, &a.RedirectURI, &a.Scope, &a.Resource, &created, &used, &revoked, &a.ClientName); err != nil {
+		if err := rows.Scan(&a.ID, &a.IdentityID, &a.ClientID, &a.RedirectURI, &a.Scope, &a.Resource, &created, &used, &revoked, &a.ClientName, &a.ClientKind); err != nil {
 			return nil, err
 		}
 		a.CreatedAt, a.LastUsedAt, a.RevokedAt = at(created), ms(used), ms(revoked)

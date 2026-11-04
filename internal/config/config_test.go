@@ -46,13 +46,13 @@ func TestParseOverrides(t *testing.T) {
 	c, err := Parse(env(map[string]string{
 		"MWE_PASSWORD": "pw", "MWE_PUBLIC_URL": "https://Events.Example.com",
 		"MWE_ADDR": "127.0.0.1:9000", "MWE_DATA_DIR": "/tmp/x", "MWE_EVENT_RETENTION": "24h",
-		"MWE_MAX_BODY_BYTES": "1024", "MWE_TRUST_PROXY": "true", "MWE_ALLOW_PRIVATE_CALLBACKS": "1",
+		"MWE_MAX_BODY_BYTES": "1024", "MWE_TRUST_PROXY": "true", "MWE_ALLOW_PRIVATE_NETWORK": "1",
 		"MWE_LOG_LEVEL": "debug",
 	}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.PublicURL != "https://events.example.com" || !c.Secure() || !c.TrustProxy || !c.AllowPrivateCallbacks || c.MaxBodyBytes != 1024 || c.EventRetention != 24*time.Hour {
+	if c.PublicURL != "https://events.example.com" || !c.Secure() || !c.TrustProxy || !c.AllowPrivateNetwork || c.MaxBodyBytes != 1024 || c.EventRetention != 24*time.Hour {
 		t.Errorf("parsed = %+v", c)
 	}
 	if !strings.HasSuffix(c.DBPath(), "mwe.db") {
@@ -78,5 +78,54 @@ func TestCallbackAllowlist(t *testing.T) {
 	}
 	if _, err := Parse(env(map[string]string{"MWE_PASSWORD": "pw", "MWE_PUBLIC_URL": "https://x.example", "MWE_CALLBACK_ALLOWLIST": "https://x.example/path"})); err == nil {
 		t.Error("an allowlist entry with a path was taken")
+	}
+}
+
+// MWE_ALLOW_PRIVATE_CALLBACKS still works as the old name of
+// MWE_ALLOW_PRIVATE_NETWORK; the two disagreeing is an error.
+func TestAllowPrivateNetworkNames(t *testing.T) {
+	base := map[string]string{"MWE_PASSWORD": "pw", "MWE_PUBLIC_URL": "http://localhost:8080"}
+	with := func(kv ...string) map[string]string {
+		m := map[string]string{}
+		for k, v := range base {
+			m[k] = v
+		}
+		for i := 0; i < len(kv); i += 2 {
+			m[kv[i]] = kv[i+1]
+		}
+		return m
+	}
+	for _, tc := range []struct {
+		env  map[string]string
+		want bool
+	}{
+		{with(), false},
+		{with("MWE_ALLOW_PRIVATE_CALLBACKS", "true"), true},
+		{with("MWE_ALLOW_PRIVATE_NETWORK", "true"), true},
+		{with("MWE_ALLOW_PRIVATE_NETWORK", "true", "MWE_ALLOW_PRIVATE_CALLBACKS", "1"), true},
+	} {
+		c, err := Parse(env(tc.env))
+		if err != nil || c.AllowPrivateNetwork != tc.want {
+			t.Errorf("%v: %v %v, want %v", tc.env, c.AllowPrivateNetwork, err, tc.want)
+		}
+	}
+	if _, err := Parse(env(with("MWE_ALLOW_PRIVATE_NETWORK", "false", "MWE_ALLOW_PRIVATE_CALLBACKS", "true"))); err == nil {
+		t.Error("disagreeing names were taken")
+	}
+	// the loopback metadata exception needs the server itself on loopback
+	c, _ := Parse(env(with("MWE_ALLOW_PRIVATE_NETWORK", "true")))
+	if !c.MetadataLoopbackAllowed() {
+		t.Error("loopback server with the switch: metadata loopback not allowed")
+	}
+	c, _ = Parse(env(map[string]string{"MWE_PASSWORD": "pw", "MWE_PUBLIC_URL": "https://events.example.com", "MWE_ALLOW_PRIVATE_NETWORK": "true"}))
+	if c.MetadataLoopbackAllowed() {
+		t.Error("a public server allowed loopback metadata fetches")
+	}
+	c, _ = Parse(env(base))
+	if c.MetadataLoopbackAllowed() {
+		t.Error("loopback metadata fetches allowed without the switch")
+	}
+	if _, err := Parse(env(with("MWE_EXTRA_CA_FILE", "/nonexistent/ca.pem"))); err == nil {
+		t.Error("a missing MWE_EXTRA_CA_FILE was taken")
 	}
 }

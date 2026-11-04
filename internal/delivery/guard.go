@@ -2,6 +2,8 @@ package delivery
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"net"
@@ -17,16 +19,23 @@ type Resolver interface {
 	LookupNetIP(ctx context.Context, network, host string) ([]netip.Addr, error)
 }
 
-// Guard keeps webhook requests away from addresses that aren't globally
-// routable. It checks every address at connection time, after its own DNS
-// lookup, and connects to the address it checked, so a name that changes
-// its answer between the check and the connection (DNS rebinding) can't
-// reach an internal host. Its client never follows redirects.
+// Guard keeps the server's outbound requests (webhook deliveries, client
+// metadata fetches) away from addresses that aren't globally routable. It
+// checks every address at connection time, after its own DNS lookup, and
+// connects to the address it checked, so a name that changes its answer
+// between the check and the connection (DNS rebinding) can't reach an
+// internal host. Its client never follows redirects.
 type Guard struct {
 	// AllowPrivate lets http:// and private, loopback and link-local
-	// addresses through: MWE_ALLOW_PRIVATE_CALLBACKS, for development.
+	// addresses through: MWE_ALLOW_PRIVATE_NETWORK, for development.
 	AllowPrivate bool
-	Resolver     Resolver
+	// AllowLoopback lets loopback addresses, and only those, through: the
+	// development exception CIMD §10.7 allows a server that itself runs on
+	// loopback.
+	AllowLoopback bool
+	// RootCAs are the roots TLS connections trust; nil for the system's.
+	RootCAs  *x509.CertPool
+	Resolver Resolver
 }
 
 // ErrBlocked is a connection to an address the guard doesn't allow.
@@ -119,7 +128,7 @@ func (g *Guard) addrs(ctx context.Context, host string) ([]netip.Addr, error) {
 	}
 	var ok []netip.Addr
 	for _, ip := range ips {
-		if g.AllowPrivate || Public(ip) {
+		if g.AllowPrivate || Public(ip) || (g.AllowLoopback && ip.Unmap().IsLoopback()) {
 			ok = append(ok, ip.Unmap())
 		}
 	}
@@ -159,6 +168,7 @@ func (g *Guard) Client(timeout time.Duration) *http.Client {
 		Transport: &http.Transport{
 			Proxy:                 nil,
 			DialContext:           g.dial,
+			TLSClientConfig:       &tls.Config{RootCAs: g.RootCAs, MinVersion: tls.VersionTLS12},
 			TLSHandshakeTimeout:   5 * time.Second,
 			ResponseHeaderTimeout: timeout,
 			MaxIdleConnsPerHost:   2,

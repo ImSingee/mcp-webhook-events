@@ -62,7 +62,8 @@ internal/cli         子命令与 stdio bridge
 | `MWE_EVENT_RETENTION` | 默认 `168h` |
 | `MWE_MAX_BODY_BYTES` | 默认 `262144`，和 SEP 的 256 KiB 上限一致 |
 | `MWE_TRUST_PROXY` | 信任 `X-Forwarded-*` |
-| `MWE_ALLOW_PRIVATE_CALLBACKS` | 开发用，允许投递到 http/内网地址 |
+| `MWE_ALLOW_PRIVATE_NETWORK` | 开发用（旧名 `MWE_ALLOW_PRIVATE_CALLBACKS` 仍有效）。允许 webhook 投递到 http/内网地址；public URL 为回环地址时，也允许从回环地址抓取 CIMD 元数据文档 |
+| `MWE_EXTRA_CA_FILE` | 额外信任的根证书（PEM），用于 CIMD 文档抓取和 webhook 投递 |
 
 ## 数据模型（SQLite）
 
@@ -154,12 +155,12 @@ internal/cli         子命令与 stdio bridge
   - 失败时指数退避重试；
   - 按规范发 gap、terminated、verification 控制消息；
   - 过期后清理。
-- 回调 URL 必须是 https，每次投递都重新解析 IP 并拒绝内网地址，除非设置了 `MWE_ALLOW_PRIVATE_CALLBACKS`。
+- 回调 URL 必须是 https，每次投递都重新解析 IP 并拒绝内网地址，除非设置了 `MWE_ALLOW_PRIVATE_NETWORK`。
 
 ### OAuth 授权服务器（`internal/oauth`）
 - **Metadata**：
   - `/.well-known/oauth-protected-resource` 和 `/.well-known/oauth-protected-resource/mcp`：resource 为 `<public>/mcp`，authorization_servers 为 `[<public>]`。
-  - `/.well-known/oauth-authorization-server`，`/.well-known/openid-configuration` 返回同一份。内容包括 `code_challenge_methods_supported:["S256"]`、`token_endpoint_auth_methods_supported:["none","client_secret_post","client_secret_basic"]`、`authorization_response_iss_parameter_supported:true`。
+  - `/.well-known/oauth-authorization-server`，`/.well-known/openid-configuration` 返回同一份。内容包括 `code_challenge_methods_supported:["S256"]`、`token_endpoint_auth_methods_supported:["none","client_secret_post","client_secret_basic"]`、`authorization_response_iss_parameter_supported:true`、`client_id_metadata_document_supported:true`。
 - **`POST /oauth/register`（RFC 7591）**：redirect_uri 只接受 https 或 loopback http。
 - **`GET /oauth/authorize`**：
   - 未登录时先显示密码登录页；
@@ -169,7 +170,7 @@ internal/cli         子命令与 stdio bridge
   - redirect_uri 精确匹配；loopback 地址忽略端口（RFC 8252）。
   - `resource` 如果传了，必须等于 MCP resource。
 - **`POST /oauth/token`**：支持 `authorization_code` 和 `refresh_token`，同时校验 resource。**`POST /oauth/revoke`** 用于撤销。
-- **CIMD**：不在本次范围内。用户指定了 DCR，2026-07-28 规范里 DCR 仍然是 MAY。
+- **CIMD（Client ID Metadata Documents）**：已支持，与 DCR 并存，依据 `draft-ietf-oauth-client-id-metadata-document-03`（2026-11 追加实现）。`client_id` 是带 path 的 https URL 时按 CIMD 处理：服务端经 SSRF 防护抓取文档（不跟随重定向、5 KiB 上限、只收 JSON），校验 `client_id` 一致、必填字段和认证方式（只接受 public client），按 HTTP 缓存头缓存快照（1 分钟到 24 小时），抓取失败时 authorize 显示错误页、不重定向。细节见 README「OAuth 客户端注册：CIMD 与 DCR」。
 
 ### Admin（密码登录与 Web UI）
 - **登录**：

@@ -2,6 +2,7 @@
 package config
 
 import (
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -29,10 +30,18 @@ type Config struct {
 	MaxBodyBytes int64
 	// TrustProxy takes the client's address from X-Forwarded-For.
 	TrustProxy bool
-	// AllowPrivateCallbacks lets webhook-mode subscriptions deliver to
-	// http:// URLs and to private or loopback addresses: for development
-	// and tests only.
-	AllowPrivateCallbacks bool
+	// AllowPrivateNetwork (MWE_ALLOW_PRIVATE_NETWORK, formerly
+	// MWE_ALLOW_PRIVATE_CALLBACKS) is for development and tests only. It
+	// lets webhook-mode subscriptions deliver to http:// URLs and private
+	// or loopback addresses, and, when the server itself runs on a
+	// loopback public URL, lets client ID metadata documents be fetched
+	// from loopback addresses (CIMD §10.7's development exception; their
+	// URLs must still be https).
+	AllowPrivateNetwork bool
+	// ExtraCAFile (MWE_EXTRA_CA_FILE) is a PEM file of root certificates
+	// trusted, besides the system's, by the server's outbound https
+	// requests: client metadata fetches and webhook deliveries.
+	ExtraCAFile string
 	// CallbackAllowlist are callback origins (scheme://host[:port]) the
 	// operator vouches for: webhook-mode subscriptions to them skip the
 	// endpoint verification handshake (SEP-3415's "server-configured
@@ -112,17 +121,39 @@ func Parse(getenv func(string) string) (Config, error) {
 			c.MaxBodyBytes = n
 		}
 	}
+	var oldPrivate, newPrivate *bool
 	for _, b := range []struct {
 		name string
-		dst  *bool
-	}{{"MWE_TRUST_PROXY", &c.TrustProxy}, {"MWE_ALLOW_PRIVATE_CALLBACKS", &c.AllowPrivateCallbacks}} {
-		if v := getenv(b.name); v != "" {
-			on, err := strconv.ParseBool(v)
-			if err != nil {
-				errs = append(errs, fmt.Errorf("%s %q must be true or false", b.name, v))
-			}
-			*b.dst = on
+		dst  **bool
+	}{{"MWE_TRUST_PROXY", nil}, {"MWE_ALLOW_PRIVATE_CALLBACKS", &oldPrivate}, {"MWE_ALLOW_PRIVATE_NETWORK", &newPrivate}} {
+		v := getenv(b.name)
+		if v == "" {
+			continue
 		}
+		on, err := strconv.ParseBool(v)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s %q must be true or false", b.name, v))
+			continue
+		}
+		if b.dst == nil {
+			c.TrustProxy = on
+		} else {
+			*b.dst = &on
+		}
+	}
+	switch {
+	case newPrivate != nil && oldPrivate != nil && *newPrivate != *oldPrivate:
+		errs = append(errs, errors.New("MWE_ALLOW_PRIVATE_NETWORK and its old name MWE_ALLOW_PRIVATE_CALLBACKS disagree: set only MWE_ALLOW_PRIVATE_NETWORK"))
+	case newPrivate != nil:
+		c.AllowPrivateNetwork = *newPrivate
+	case oldPrivate != nil:
+		c.AllowPrivateNetwork = *oldPrivate
+	}
+	if v := getenv("MWE_EXTRA_CA_FILE"); v != "" {
+		if _, err := os.Stat(v); err != nil {
+			errs = append(errs, fmt.Errorf("MWE_EXTRA_CA_FILE %q: %v", v, err))
+		}
+		c.ExtraCAFile = v
 	}
 	for _, v := range strings.Split(getenv("MWE_CALLBACK_ALLOWLIST"), ",") {
 		if v = strings.TrimSpace(v); v == "" {
@@ -162,6 +193,35 @@ func PublicURL(raw string) (string, error) {
 		return "", fmt.Errorf("MWE_PUBLIC_URL %q must use https unless its host is localhost", raw)
 	}
 	return strings.ToLower(u.Scheme) + "://" + strings.ToLower(u.Host), nil
+}
+
+// MetadataLoopbackAllowed reports whether client ID metadata documents may
+// be fetched from loopback addresses: only in development
+// (MWE_ALLOW_PRIVATE_NETWORK) and only when the server's own public URL is
+// on loopback, as CIMD §10.7 requires of that exception.
+func (c Config) MetadataLoopbackAllowed() bool {
+	u, err := url.Parse(c.PublicURL)
+	return c.AllowPrivateNetwork && err == nil && IsLoopbackHost(u.Hostname())
+}
+
+// RootCAs are the roots the server's outbound https requests trust: the
+// system's, plus MWE_EXTRA_CA_FILE's; nil (the system's) without it.
+func (c Config) RootCAs() (*x509.CertPool, error) {
+	if c.ExtraCAFile == "" {
+		return nil, nil
+	}
+	pem, err := os.ReadFile(c.ExtraCAFile)
+	if err != nil {
+		return nil, fmt.Errorf("MWE_EXTRA_CA_FILE: %w", err)
+	}
+	pool, err := x509.SystemCertPool()
+	if err != nil || pool == nil {
+		pool = x509.NewCertPool()
+	}
+	if !pool.AppendCertsFromPEM(pem) {
+		return nil, fmt.Errorf("MWE_EXTRA_CA_FILE %s holds no PEM certificate", c.ExtraCAFile)
+	}
+	return pool, nil
 }
 
 // IsLoopbackHost reports whether host (without port) is localhost or a

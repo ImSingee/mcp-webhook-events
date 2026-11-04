@@ -7,7 +7,7 @@
   - **poll**：`events/poll`；
   - **webhook**：`events/subscribe`，按 Standard Webhooks 签名回调。
 - MCP 主路径是无状态的 2026-07-28 协议（`server/discover`、tools、events）。2025-06-18 和 2025-11-25 的旧客户端通过 `initialize` 使用 tools 和 `ping`，但拿不到 events，因为扩展只定义在 2026-07-28 上。
-- 内置 OAuth 2.1 授权服务器：动态注册（DCR）、强制 PKCE S256、RFC 8707 resource 校验、回调带 `iss`、refresh token 轮换（重放时撤销整个授权）。
+- 内置 OAuth 2.1 授权服务器：客户端元数据文档（CIMD）和动态注册（DCR）两种注册方式并存，强制 PKCE S256、RFC 8707 resource 校验、回调带 `iss`、refresh token 轮换（重放时撤销整个授权）。
 - 平台是单用户的：一个管理员密码，下面可以有多个 **Identity**（每个 Agent 一个）。授权时在 consent 页上选择或新建 Identity，token 绑定到这个 Identity。
 - 两个二进制：
   - `mwe-server`：服务端加 Web 管理界面；
@@ -59,7 +59,8 @@ MWE_PASSWORD=... MWE_PUBLIC_URL=https://events.example.com bin/mwe-server
 | `MWE_EVENT_RETENTION` | `168h` | 事件保留时长。超出保留期的 cursor 续传时会得到 `truncated: true` |
 | `MWE_MAX_BODY_BYTES` | `262144` | webhook 请求体上限（256 KiB），超出返回 413 |
 | `MWE_TRUST_PROXY` | `false` | 信任 `X-Forwarded-For` |
-| `MWE_ALLOW_PRIVATE_CALLBACKS` | `false` | **仅限开发**。允许 webhook 投递模式回调 http 地址和内网、回环地址 |
+| `MWE_ALLOW_PRIVATE_NETWORK` | `false` | **仅限开发**。旧名 `MWE_ALLOW_PRIVATE_CALLBACKS` 仍然有效，两者同时设置且取值不同会报错。打开后：webhook 投递模式可以回调 http 地址和内网、回环地址；如果 `MWE_PUBLIC_URL` 本身是回环地址，还允许从回环地址抓取 CIMD 元数据文档（CIMD §10.7 的开发例外，元数据 URL 仍必须是 https）。生产环境不要打开 |
+| `MWE_EXTRA_CA_FILE` | 空 | PEM 格式的额外根证书，在系统根证书之外信任。用于抓取 CIMD 元数据文档和 webhook 投递，例如本地开发用自签证书，或企业内部 CA |
 | `MWE_CALLBACK_ALLOWLIST` | 空 | 逗号分隔的回调 origin（如 `https://hooks.example.com`）。列表内的 URL 视为已由运维确认，订阅时免验证握手（SEP-3415 端点确认方式 2）。https 规则和每次连接时的 SSRF 校验照常生效 |
 | `MWE_LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
 
@@ -103,9 +104,9 @@ MCP 地址是 `<MWE_PUBLIC_URL>/mcp`，只支持 OAuth 登录。
 ### 支持远程 MCP 和 OAuth 的客户端
 
 直接把 `https://events.example.com/mcp` 填给客户端即可：
-1. 客户端收到 401，从 `WWW-Authenticate` 找到 `/.well-known/oauth-protected-resource/mcp`；
-2. 通过 DCR 注册自己；
-3. 打开浏览器进入 consent 页。
+1. 客户端收到 401，从 `WWW-Authenticate` 找到 `/.well-known/oauth-protected-resource/mcp`，再找到授权服务器元数据；
+2. 元数据里有 `client_id_metadata_document_supported: true`，支持 CIMD 的客户端（例如 Claude Code）直接用自己的元数据文档 URL 作为 `client_id`；不支持的客户端通过 `registration_endpoint` 动态注册（DCR）；
+3. 打开浏览器进入 consent 页，选择或新建 Identity。
 
 注意：
 - 要使用 events，客户端必须支持 2026-07-28 协议和 SEP-3415；
@@ -132,9 +133,48 @@ bridge 的行为：
 - 收到 `notifications/cancelled` 时中止对应的 HTTP 请求；
 - 401 时刷新一次 token，仍然失败就返回 JSON-RPC 错误，提示执行 `mwe login`。
 
+### OAuth 客户端注册：CIMD 与 DCR
+
+授权服务器同时支持两种客户端注册方式：
+
+| 方式 | `client_id` | 说明 |
+|---|---|---|
+| CIMD（Client ID Metadata Document） | 客户端元数据文档的 https URL | MCP 2026-07-28 推荐（SHOULD）。服务端按需抓取并校验文档，客户端无需注册 |
+| DCR（RFC 7591 动态注册） | 服务端生成的 `cli_…` | MCP 2026-07-28 降为 MAY 并标为 deprecated，仍保留给不支持 CIMD 的客户端和 `mwe login` |
+
+CIMD 的实现依据 `draft-ietf-oauth-client-id-metadata-document-03`（原文在 [docs/spec/](docs/spec/)）：
+
+- **client_id URL**：必须是 https，必须有 `/` 以外的 path，不能带 fragment、用户信息、`.`/`..` 路径段，按原样比较，不做任何规范化；不能等于本服务的 issuer 或 MCP resource。
+- **抓取**：
+  - 走和 webhook 投递相同的 SSRF 防护：每次连接都重新解析 DNS，只连全局可路由地址，不跟随重定向，不使用环境变量里的代理，不带 cookie；
+  - 发送 `Accept: application/json`，5 秒超时，最多读 5 KiB；
+  - 只接受 `200` 和 JSON（`application/json` 或 `application/*+json`）。
+- **文档校验**：
+  - `client_id` 必须与 URL 完全一致；
+  - 必须有 `client_name` 和非空的 `redirect_uris`（https 或回环 http）；
+  - 不能包含 `client_secret`，不能声明 `client_secret_*` 这类共享密钥认证方式，`jwks` 和 `jwks_uri` 不能同时出现；
+  - 认证方式：优先看 `token_endpoint_auth_methods_supported`，其次看 `token_endpoint_auth_method`，都没有则视为 `none`；候选里没有 `none` 就拒绝；
+  - `grant_types` 必须包含 `authorization_code`，`response_types` 必须包含 `code`。
+- **redirect_uri 匹配**：按字符串精确比较；唯一的例外是 http 回环地址（`127.0.0.1`、`[::1]`、`localhost`）可以换端口（RFC 9700 §4.1.3、RFC 8252 §7.3），主机名、路径和 query 仍须一致。例如文档登记 `http://localhost/callback`，请求可以用 `http://localhost:53122/callback`，但不能用 `http://127.0.0.1:53122/callback`。
+- **缓存**：
+  - 校验通过的文档存为快照，新鲜期取 `Cache-Control` 的 `s-maxage` 或 `max-age`（减去 `Age`），限制在 1 分钟到 24 小时之间；没有缓存头时为 10 分钟；忽略 `Expires`；
+  - 抓取失败或文档无效都不会写入缓存，也不会延长已有快照的新鲜期。
+- **失败处理**：
+  - authorize 时抓取失败或校验不通过，直接显示错误页，不会重定向回客户端（CIMD §6.1）；
+  - token 端点遇到瞬时失败（网络错误、超时、5xx）时，沿用上一次校验通过的快照，以免已有授权因对方故障失效；没有快照就返回 503；遇到终止性失败返回 `invalid_client`；
+  - 文档的 `client_id` 与 URL 不一致时，立即撤销该客户端已有的全部授权（CIMD §6.1）。
+- **token**：CIMD 客户端是 public client，token 请求带任何客户端凭据都会被拒绝（`invalid_client`）。文档的 `grant_types` 包含 `refresh_token` 才发放和接受 refresh token，每次 refresh 都按缓存规则确认文档仍然有效。
+- **consent 页**：显示文档里的 `client_name` 和文档所在主机（`metadata_host`）。CIMD 客户端要回调本机地址时，额外显示 `localhost_redirect` 警告。
+
+本地开发时，想从本机的元数据服务器抓文档，需要同时满足：
+- `MWE_PUBLIC_URL` 是回环地址；
+- 打开 `MWE_ALLOW_PRIVATE_NETWORK`；
+- 元数据服务器使用 https，自签证书通过 `MWE_EXTRA_CA_FILE` 信任。
+
 ### 已知客户端情况
 
 - **Mastra `@mastra/mcp` ≥ 2.5**：支持 push、poll 和 webhook，但它在 `events/*` 请求上**不发送 `Mcp-Name` header**。SEP-3415 规定客户端 MUST 发送这个 header，缺失时服务端以 `400` + `-32020` 拒绝。本服务端按规范严格执行，所以接入时需要用自定义 `fetch` 补上这个 header，示例见下文「第三方客户端互通」。
+- **Claude Code ≥ 2.1**：OAuth 登录走 CIMD，`client_id` 是 `https://claude.ai/oauth/claude-code-client-metadata`。它的文档登记了不带端口的 `http://localhost/callback` 和 `http://127.0.0.1/callback`，运行时用随机端口回调，符合上面的 loopback 端口规则。已用 2.1.308 实测 `claude mcp login` 走完 CIMD 登录，登录后 `server/discover` 和 `tools/list` 正常。Claude Code 只用 tools，不消费 events。
 - **ChatGPT**：只支持 webhook 模式，读取的是顶层 `capabilities.events`。服务端在 `server/discover` 里同时声明了它和 `capabilities.extensions["io.modelcontextprotocol/events"]`。
 
 ## MCP 能力
@@ -350,7 +390,9 @@ for await (const ev of sub) console.log(ev.data);
 
 ## 已知限制
 
-- 不支持 OAuth Client ID Metadata Documents（CIMD）。2026-07-28 规范推荐 CIMD，DCR 已被标为 deprecated，但仍是 MAY。
+- CIMD 客户端只能是 public client（`token_endpoint_auth_method` 为 `none`）。只提供 `private_key_jwt` 等非对称认证方式的元数据文档会被拒绝；同时提供 `none` 的则按 public client 接受。
+- consent 页和授权列表不显示 CIMD 客户端的 logo：CIMD §10.9 要求服务端先抓取并托管图片才能展示，本服务没有实现。
+- 抓取 CIMD 元数据文档和 webhook 投递一样，刻意不走 `HTTP_PROXY`/`HTTPS_PROXY`（否则 SSRF 校验会被代理绕过）。服务端所在网络必须能直连客户端的元数据主机。使用 fake-IP DNS 的网络环境（例如某些代理软件的 TUN 模式会把域名解析到 `198.18.0.0/15`）里，抓取会被 SSRF 防护按规范拒绝。
 - webhook 投递模式的端点确认只实现了「验证握手」和「服务端 allowlist」两种方式，没有实现 `/.well-known/mcp-webhook-receiver.json`，也不支持 `v1a` 非对称签名。
 - `subscriptions/listen` 是最小实现：tools 列表是静态的，事件类型也是固定的，所以不发任何 list_changed。
 - 订阅不会授予「永不过期」：`ttlMs: null` 也只给 7 天。

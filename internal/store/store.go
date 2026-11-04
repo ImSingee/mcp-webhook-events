@@ -224,6 +224,17 @@ CREATE TABLE webhook_verifications (
   PRIMARY KEY (identity_id, url)
 );
 `,
+	// CIMD (Client ID Metadata Document) clients: identified by their
+	// https URL, with the last document fetched and validated kept as a
+	// snapshot, and how long it stays fresh by its HTTP cache headers.
+	`
+ALTER TABLE oauth_clients ADD COLUMN kind TEXT NOT NULL DEFAULT 'dcr';
+ALTER TABLE oauth_clients ADD COLUMN client_uri TEXT;
+ALTER TABLE oauth_clients ADD COLUMN logo_uri TEXT;
+ALTER TABLE oauth_clients ADD COLUMN metadata TEXT;
+ALTER TABLE oauth_clients ADD COLUMN metadata_fetched_at INTEGER;
+ALTER TABLE oauth_clients ADD COLUMN metadata_fresh_until INTEGER;
+`,
 }
 
 func (s *Store) migrate(ctx context.Context) error {

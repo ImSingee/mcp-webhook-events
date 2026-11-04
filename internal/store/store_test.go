@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/ImSingee/mcp-webhook-events/internal/sqlitedb"
 )
 
 func open(t *testing.T) *Store {
@@ -92,5 +94,66 @@ func TestEventsHeadAndPrune(t *testing.T) {
 	evs, err := s.EventsFor(ctx, "idn_other", 0, 10, 10)
 	if err != nil || len(evs) != 1 || evs[0].ID != "evt_z" {
 		t.Fatalf("another identity sees %+v, %v; want only the broadcast", evs, err)
+	}
+}
+
+// A database made before CIMD (schema 1) upgrades in place: its clients
+// become dcr clients and keep working.
+func TestMigrateFromSchema1(t *testing.T) {
+	ctx := context.Background()
+	p := filepath.Join(t.TempDir(), "old.db")
+	db, err := sqlitedb.Open(ctx, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{
+		`CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
+		migrations[0],
+		`INSERT INTO meta (key, value) VALUES ('schema_version', '1')`,
+		`INSERT INTO oauth_clients (client_id, client_name, redirect_uris, token_endpoint_auth_method, grant_types, created_at) VALUES ('cli_old', 'Old', '["http://127.0.0.1/cb"]', 'none', '["authorization_code"]', 1)`,
+	} {
+		if _, err := db.ExecContext(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	db.Close()
+	s, err := Open(ctx, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	c, err := s.GetClient(ctx, "cli_old")
+	if err != nil || c.Kind != ClientDCR || c.Name != "Old" || c.MetadataFetchedAt != nil {
+		t.Fatalf("old client after the upgrade = %+v, %v", c, err)
+	}
+}
+
+func TestPutCIMDClient(t *testing.T) {
+	ctx := context.Background()
+	s := open(t)
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	fresh := now.Add(time.Hour)
+	c := Client{ID: "https://app.example/client.json", Name: "App", RedirectURIs: []string{"http://127.0.0.1/cb"}, TokenAuthMethod: "none",
+		GrantTypes: []string{"authorization_code"}, ClientURI: "https://app.example", Metadata: json.RawMessage(`{"client_id":"x"}`), MetadataFetchedAt: &now, MetadataFreshUntil: &fresh}
+	if err := s.PutCIMDClient(ctx, c); err != nil {
+		t.Fatal(err)
+	}
+	c.Name = "App 2"
+	if err := s.PutCIMDClient(ctx, c); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetClient(ctx, c.ID)
+	if err != nil || got.Kind != ClientCIMD || got.Name != "App 2" || !got.MetadataFreshUntil.Equal(fresh) || got.ClientURI != "https://app.example" || string(got.Metadata) != `{"client_id":"x"}` {
+		t.Fatalf("CIMD client = %+v, %v", got, err)
+	}
+	// a dynamically registered client is never overwritten
+	if err := s.CreateClient(ctx, Client{ID: "cli_x", Name: "DCR", RedirectURIs: []string{"https://a/cb"}, TokenAuthMethod: "none", GrantTypes: []string{"authorization_code"}, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutCIMDClient(ctx, Client{ID: "cli_x", Name: "Hijack", RedirectURIs: []string{"https://evil/cb"}, TokenAuthMethod: "none"}); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.GetClient(ctx, "cli_x"); got.Name != "DCR" || got.Kind != ClientDCR {
+		t.Fatalf("PutCIMDClient overwrote a DCR client: %+v", got)
 	}
 }

@@ -44,7 +44,8 @@ type App struct {
 type Options struct {
 	// Assets replaces the UI's files.
 	Assets fs.FS
-	// Resolver replaces the delivery guard's DNS.
+	// Resolver replaces the DNS of the outbound guards (webhook delivery,
+	// client metadata fetches).
 	Resolver delivery.Resolver
 }
 
@@ -56,11 +57,19 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger, opt Options) 
 	}
 	hub := events.NewHub()
 	svc := core.New(cfg, st, hub, log)
-	guard := &delivery.Guard{AllowPrivate: cfg.AllowPrivateCallbacks, Resolver: opt.Resolver}
+	roots, err := cfg.RootCAs()
+	if err != nil {
+		st.Close()
+		return nil, err
+	}
+	guard := &delivery.Guard{AllowPrivate: cfg.AllowPrivateNetwork, RootCAs: roots, Resolver: opt.Resolver}
 	worker := delivery.NewWorker(st, hub, guard, log.With("component", "delivery"))
 	worker.Allowlisted = cfg.CallbackAllowed
 	svc.Subs = worker
 	auth := oauth.New(cfg, st, svc, log.With("component", "oauth"))
+	// client metadata documents: public addresses only, but for CIMD's
+	// development exception (a loopback server, MWE_ALLOW_PRIVATE_NETWORK)
+	auth.MetadataClient = oauth.MetadataHTTPClient(cfg.MetadataLoopbackAllowed(), roots, opt.Resolver)
 	assets := opt.Assets
 	if assets == nil {
 		assets = web.Assets()

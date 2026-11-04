@@ -6,8 +6,11 @@
 //   - Protected Resource Metadata (RFC 9728) for the MCP endpoint, and
 //     Authorization Server Metadata (RFC 8414, also served as OpenID
 //     Connect discovery);
-//   - Dynamic Client Registration (RFC 7591), redirect URIs https or
-//     loopback http only;
+//   - Client ID Metadata Documents (draft-ietf-oauth-client-id-metadata-
+//     document, cimd.go): a client_id that is an https URL names its own
+//     metadata, fetched and cached through the SSRF guard;
+//   - Dynamic Client Registration (RFC 7591), deprecated by MCP but still
+//     offered, redirect URIs https or loopback http only;
 //   - the authorization code grant with PKCE S256 required, exact redirect
 //     URI matching (a loopback redirect's port ignored, RFC 8252 §7.3),
 //     the resource indicator checked (RFC 8707), and iss in every
@@ -58,8 +61,18 @@ type Server struct {
 	CodeTTL    time.Duration
 	RequestTTL time.Duration
 
+	// MetadataClient fetches client ID metadata documents; its transport
+	// must refuse non-public addresses (MetadataHTTPClient).
+	MetadataClient     *http.Client
+	MetadataMinTTL     time.Duration
+	MetadataDefaultTTL time.Duration
+	MetadataMaxTTL     time.Duration
+
 	regMu   sync.Mutex
 	regSeen map[string][]time.Time // registrations per IP in the last hour
+
+	fetchMu  sync.Mutex
+	fetching map[string]*fetchCall // metadata fetches in flight, by client_id
 }
 
 // New is a server with the token lifetimes the platform uses.
@@ -70,7 +83,14 @@ func New(cfg config.Config, st *store.Store, svc *core.Service, log *slog.Logger
 		RefreshTTL: 90 * 24 * time.Hour,
 		CodeTTL:    60 * time.Second,
 		RequestTTL: 10 * time.Minute,
-		regSeen:    map[string][]time.Time{},
+
+		MetadataClient:     MetadataHTTPClient(false, nil, nil),
+		MetadataMinTTL:     DefaultMetadataMinTTL,
+		MetadataDefaultTTL: DefaultMetadataDefaultTTL,
+		MetadataMaxTTL:     DefaultMetadataMaxTTL,
+
+		regSeen:  map[string][]time.Time{},
+		fetching: map[string]*fetchCall{},
 	}
 }
 
@@ -136,7 +156,7 @@ func (s *Server) serverMetadata(w http.ResponseWriter, r *http.Request) {
 		"revocation_endpoint_auth_methods_supported":     []string{"none", "client_secret_post", "client_secret_basic"},
 		"scopes_supported":                               []string{Scope},
 		"authorization_response_iss_parameter_supported": true,
-		"client_id_metadata_document_supported":          false,
+		"client_id_metadata_document_supported":          true,
 	})
 }
 
@@ -346,9 +366,16 @@ var verifierRe = regexp.MustCompile(`^[A-Za-z0-9._~-]{43,128}$`)
 
 func (s *Server) authorize(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	c, err := s.Store.GetClient(r.Context(), q.Get("client_id"))
-	if err != nil {
-		errorPage(w, "未知的 client_id。应用需要先通过动态注册（/oauth/register）获得 client_id。")
+	clientID := q.Get("client_id")
+	c, err := s.ResolveClient(r.Context(), clientID, false)
+	var merr *MetadataError
+	switch {
+	case errors.As(err, &merr):
+		// CIMD §6.1: never redirect to a client whose metadata failed
+		errorPage(w, "无法使用该应用的客户端元数据文档（"+clientID+"）："+merr.Msg)
+		return
+	case err != nil:
+		errorPage(w, "未知的 client_id。应用需要用一个托管了客户端元数据文档的 https URL 作为 client_id，或先通过动态注册（/oauth/register）获得 client_id。")
 		return
 	}
 	redirect := q.Get("redirect_uri")
@@ -357,7 +384,7 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request) {
 	}
 	matched := false
 	for _, reg := range c.RedirectURIs {
-		if RedirectMatches(reg, redirect) {
+		if redirectMatches(c, reg, redirect) {
 			matched = true
 			break
 		}
@@ -475,10 +502,26 @@ func (s *Server) Deny(ctx context.Context, id string) (string, error) {
 	return s.Redirect(ar.RedirectURI, url.Values{"error": {"access_denied"}, "error_description": {"the user denied the request"}, "state": {ar.State}}), nil
 }
 
+// authFail is a token or revocation request refused for its client.
+type authFail struct {
+	status int
+	code   string
+	desc   string
+}
+
+func (f *authFail) write(w http.ResponseWriter) { oauthError(w, f.status, f.code, f.desc) }
+
+func badClient(desc string) *authFail {
+	return &authFail{status: http.StatusUnauthorized, code: "invalid_client", desc: desc}
+}
+
 // clientAuth authenticates the client of a token or revocation request:
 // HTTP Basic, client_secret in the form, or just client_id for a public
-// client.
-func (s *Server) clientAuth(r *http.Request) (store.Client, bool, string) {
+// client. A CIMD client is public and must present no credentials
+// (CIMD §5); resolve has its document checked, from the cache or fetched,
+// the token endpoint answering 503 to a transient failure with no good
+// snapshot to fall back on and invalid_client to a terminal one (§6.1).
+func (s *Server) clientAuth(r *http.Request, resolve bool) (store.Client, *authFail) {
 	id, secret, basic := r.BasicAuth()
 	if basic {
 		id, _ = url.QueryUnescape(id)
@@ -487,19 +530,51 @@ func (s *Server) clientAuth(r *http.Request) (store.Client, bool, string) {
 		id, secret = r.PostForm.Get("client_id"), r.PostForm.Get("client_secret")
 	}
 	if id == "" {
-		return store.Client{}, false, "client_id is required"
+		return store.Client{}, badClient("client_id is required")
+	}
+	if IsClientIDURL(id) {
+		if basic || secret != "" || r.PostForm.Get("client_assertion") != "" {
+			return store.Client{}, badClient("a client identified by its metadata document URL is a public client and must not send client credentials")
+		}
+		if !resolve {
+			c, err := s.Store.GetClient(r.Context(), id)
+			if err != nil || c.Kind != store.ClientCIMD {
+				return store.Client{}, badClient("unknown client")
+			}
+			return c, nil
+		}
+		c, err := s.ResolveClient(r.Context(), id, true)
+		var merr *MetadataError
+		switch {
+		case errors.As(err, &merr) && merr.Transient:
+			return store.Client{}, &authFail{status: http.StatusServiceUnavailable, code: "temporarily_unavailable", desc: merr.Msg}
+		case errors.As(err, &merr):
+			return store.Client{}, badClient(merr.Msg)
+		case err != nil:
+			s.Log.Error("resolve client", "client_id", id, "err", err)
+			return store.Client{}, &authFail{status: http.StatusInternalServerError, code: "server_error", desc: "could not load the client"}
+		}
+		return c, nil
 	}
 	c, err := s.Store.GetClient(r.Context(), id)
-	if err != nil {
-		return store.Client{}, false, "unknown client"
+	if err != nil || c.Kind != store.ClientDCR {
+		return store.Client{}, badClient("unknown client")
 	}
 	if c.TokenAuthMethod == "none" {
-		return c, true, ""
+		return c, nil
 	}
 	if secret == "" || !idgen.HashEqual(secret, c.SecretHash) {
-		return store.Client{}, false, "client authentication failed"
+		return store.Client{}, badClient("client authentication failed")
 	}
-	return c, true, ""
+	return c, nil
+}
+
+// refreshAllowed says whether a client gets refresh tokens: a CIMD client
+// only when its document lists the refresh_token grant (MCP clients
+// "SHOULD include refresh_token in their grant_types"); a dynamically
+// registered one always, as before.
+func refreshAllowed(c store.Client) bool {
+	return c.Kind != store.ClientCIMD || slices.Contains(c.GrantTypes, "refresh_token")
 }
 
 func (s *Server) parseForm(w http.ResponseWriter, r *http.Request) bool {
@@ -522,13 +597,16 @@ func (s *Server) issue() (access, refresh string, tokens []store.Token) {
 
 func (s *Server) tokenResponse(w http.ResponseWriter, access, refresh, scope string) {
 	w.Header().Set("Pragma", "no-cache")
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{
-		"access_token":  access,
-		"token_type":    "Bearer",
-		"expires_in":    int(s.AccessTTL / time.Second),
-		"refresh_token": refresh,
-		"scope":         scope,
-	})
+	out := map[string]any{
+		"access_token": access,
+		"token_type":   "Bearer",
+		"expires_in":   int(s.AccessTTL / time.Second),
+		"scope":        scope,
+	}
+	if refresh != "" {
+		out["refresh_token"] = refresh
+	}
+	httpx.WriteJSON(w, http.StatusOK, out)
 }
 
 // grantError is a token request the grant check refused.
@@ -545,9 +623,9 @@ func (s *Server) token(w http.ResponseWriter, r *http.Request) {
 	if !s.parseForm(w, r) {
 		return
 	}
-	c, ok, why := s.clientAuth(r)
-	if !ok {
-		oauthError(w, http.StatusUnauthorized, "invalid_client", why)
+	c, fail := s.clientAuth(r, true)
+	if fail != nil {
+		fail.write(w)
 		return
 	}
 	f := r.PostForm
@@ -565,6 +643,9 @@ func (s *Server) token(w http.ResponseWriter, r *http.Request) {
 		}
 		fam := store.Family{ID: idgen.ID("auf")}
 		access, refresh, tokens := s.issue()
+		if !refreshAllowed(c) {
+			refresh, tokens = "", tokens[:1]
+		}
 		revoked, err := s.Store.RedeemCode(r.Context(), idgen.Hash(code), func(cd store.Code) error {
 			switch {
 			case cd.ClientID != c.ID:
@@ -590,6 +671,10 @@ func (s *Server) token(w http.ResponseWriter, r *http.Request) {
 		rt := f.Get("refresh_token")
 		if rt == "" {
 			oauthError(w, http.StatusBadRequest, "invalid_request", "refresh_token is required")
+			return
+		}
+		if !refreshAllowed(c) {
+			oauthError(w, http.StatusBadRequest, "unauthorized_client", "the client's metadata document doesn't list the refresh_token grant")
 			return
 		}
 		if sc := f.Get("scope"); sc != "" {
@@ -647,9 +732,9 @@ func (s *Server) revoke(w http.ResponseWriter, r *http.Request) {
 	if !s.parseForm(w, r) {
 		return
 	}
-	c, ok, why := s.clientAuth(r)
-	if !ok {
-		oauthError(w, http.StatusUnauthorized, "invalid_client", why)
+	c, fail := s.clientAuth(r, false)
+	if fail != nil {
+		fail.write(w)
 		return
 	}
 	if t := r.PostForm.Get("token"); t != "" {
