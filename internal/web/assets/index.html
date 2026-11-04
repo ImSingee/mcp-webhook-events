@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>事件交换台 · MWE</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <script src="/theme.js"></script>
+    <link rel="stylesheet" href="/app.css" />
+    <script src="/common.js" defer></script>
+    <script src="/app.js" defer></script>
+  </head>
+  <body data-page="admin">
+    <a class="skip" href="#main">跳到主内容</a>
+    <header class="topbar">
+      <a class="brand" href="#/identities">
+        <span class="mark" aria-hidden="true">
+          <i></i>
+          <i></i>
+          <i></i>
+        </span>
+        <span>
+          MWE
+          <span class="brand-sub">事件交换台</span>
+        </span>
+      </a>
+      <div class="top-actions">
+        <span id="version" class="version">…</span>
+        <button
+          id="mcp-copy"
+          class="button quiet mono"
+          disabled
+          title="复制 MCP URL"
+        >
+          MCP ↗
+        </button>
+        <button
+          class="button quiet theme-trigger"
+          aria-label="切换主题"
+          aria-haspopup="menu"
+        >
+          主题
+        </button>
+        <button id="logout" class="button quiet">退出</button>
+      </div>
+    </header>
+    <div class="shell">
+      <aside class="sidebar">
+        <div class="nav-label">工作空间</div>
+        <nav aria-label="主导航">
+          <a href="#/identities" data-nav="identities">
+            <span aria-hidden="true">◈</span>
+            Agent Identity
+          </a>
+          <a href="#/events" data-nav="events">
+            <span aria-hidden="true">≋</span>
+            事件流
+          </a>
+          <a href="#/broadcast" data-nav="broadcast">
+            <span aria-hidden="true">↗</span>
+            平台广播
+          </a>
+        </nav>
+        <div class="sidebar-note">
+          <span class="dot"></span>
+          Webhook → MCP Events
+          <br />
+          <span class="mono">SEP-3415</span>
+        </div>
+      </aside>
+      <main id="main" tabindex="-1">
+        <div class="loading" role="status">正在连接工作空间…</div>
+      </main>
+    </div>
+    <div id="toasts" class="toasts" role="status" aria-live="polite"></div>
+  </body>
+</html>

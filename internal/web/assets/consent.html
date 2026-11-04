@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>授权接入 · MWE</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <script src="/theme.js"></script>
+    <link rel="stylesheet" href="/app.css" />
+    <script src="/common.js" defer></script>
+    <script src="/auth.js" defer></script>
+  </head>
+  <body data-page="consent" class="auth-page">
+    <header class="auth-top">
+      <a href="/" class="brand">
+        <span class="mark" aria-hidden="true">
+          <i></i>
+          <i></i>
+          <i></i>
+        </span>
+        MWE
+      </a>
+      <button
+        class="button quiet theme-trigger"
+        aria-label="切换主题"
+        aria-haspopup="menu"
+      >
+        主题
+      </button>
+    </header>
+    <main class="auth-main consent-main" id="consent">
+      <div class="loading" role="status">正在读取授权请求…</div>
+    </main>
+    <footer class="auth-footer">
+      <span>请确认发起接入的程序是你信任的应用。</span>
+      <span>OAuth 2.1</span>
+    </footer>
+    <div id="toasts" class="toasts" role="status" aria-live="polite"></div>
+  </body>
+</html>

@@ -1,0 +1,10 @@
+/bin/
+/data/
+/dist/
+*.db
+*.db-wal
+*.db-shm
+.env
+/mwe
+/mwe-server
+/.playwright-mcp/

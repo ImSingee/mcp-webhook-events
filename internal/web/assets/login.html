@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>登录 · MWE</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <script src="/theme.js"></script>
+    <link rel="stylesheet" href="/app.css" />
+    <script src="/common.js" defer></script>
+    <script src="/auth.js" defer></script>
+  </head>
+  <body data-page="login" class="auth-page">
+    <header class="auth-top">
+      <span class="brand">
+        <span class="mark" aria-hidden="true">
+          <i></i>
+          <i></i>
+          <i></i>
+        </span>
+        MWE
+      </span>
+      <button
+        class="button quiet theme-trigger"
+        aria-label="切换主题"
+        aria-haspopup="menu"
+      >
+        主题
+      </button>
+    </header>
+    <main class="auth-main">
+      <section class="login-panel">
+        <div class="route-diagram" aria-hidden="true">
+          <span>Webhook</span>
+          <b>→</b>
+          <span>MWE</span>
+          <b>→</b>
+          <span>Agent</span>
+        </div>
+        <h1>连接事件与 Agent。</h1>
+        <p class="intro">
+          登录事件交换台，管理你的 Agent 身份、接入与事件投递。
+        </p>
+        <form id="login-form">
+          <div class="field">
+            <label for="password">管理员密码</label>
+            <input
+              id="password"
+              name="password"
+              type="password"
+              autocomplete="current-password"
+              required
+              autofocus
+            />
+          </div>
+          <p id="login-error" class="error" role="alert" hidden></p>
+          <button class="button primary full" id="login-submit" type="submit">
+            登录工作空间
+            <span aria-hidden="true">→</span>
+          </button>
+        </form>
+        <p class="auth-note">单用户工作空间 · 使用服务端配置的固定密码</p>
+      </section>
+    </main>
+    <footer class="auth-footer">
+      <span>Webhook → MCP Events</span>
+      <span id="version">MWE</span>
+    </footer>
+    <div id="toasts" class="toasts" role="status" aria-live="polite"></div>
+  </body>
+</html>
