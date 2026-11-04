@@ -357,7 +357,10 @@ func Login(ctx context.Context, hc *http.Client, d Discovery, opt LoginOptions) 
 		if res.err != nil {
 			msg = "登录失败 / Sign-in failed: " + html.EscapeString(res.err.Error())
 		}
-		fmt.Fprintf(w, `<!doctype html><meta charset="utf-8"><title>mwe</title><body style="font:16px system-ui;margin:4rem auto;max-width:36rem">%s</body>`, msg)
+		// The empty inline icon keeps the browser from requesting
+		// /favicon.ico after this one-shot server has already shut down.
+		fmt.Fprintf(w, `<!doctype html><meta charset="utf-8"><title>mwe</title><link rel="icon" href="data:,">`+
+			`<body style="font:16px system-ui;margin:4rem auto;max-width:36rem">%s</body>`, msg)
 		select {
 		case done <- res:
 		default:

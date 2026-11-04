@@ -67,12 +67,20 @@ func browserFor(t *testing.T, s *apptest.Server, identity string) func(string) e
 			t.Errorf("approve: %d %s", resp.StatusCode, body)
 			return nil
 		}
-		go func() {
-			r, err := http.Get(apptest.JSON(t, body)["redirect_url"].(string))
-			if err == nil {
-				r.Body.Close()
-			}
-		}()
+		// The CLI's callback server is already listening and its handler
+		// never blocks, so the browser leg can run synchronously.
+		r, err := http.Get(apptest.JSON(t, body)["redirect_url"].(string))
+		if err != nil {
+			t.Errorf("callback: %v", err)
+			return nil
+		}
+		page, _ := io.ReadAll(r.Body)
+		r.Body.Close()
+		// A page without its own icon makes the browser fetch /favicon.ico
+		// from the callback server after it has shut down.
+		if !strings.Contains(string(page), `<link rel="icon" href="data:,">`) {
+			t.Errorf("callback page declares no inline icon: %s", page)
+		}
 		return nil
 	}
 }
